@@ -1,7 +1,7 @@
 # InboxForge
 
 ## Overview
-Full Gmail mailbox downloader, AI-powered organizer, and analytics suite. PyQt6 GUI with 10 power features: statistics dashboard, group-by views, subscription manager, feedback loop, auto clean rules, attachment extraction, CSV/JSON export, Gmail filter import, sensitive content scanner, and AI thread summarization.
+Full Gmail mailbox downloader, AI-powered organizer, and analytics suite. PyQt6 GUI with 16+ features including email preview, search/filter, statistics dashboard, contact analysis, subscription manager, HTML archive export, and more.
 
 ## Tech Stack
 - Python 3, PyQt6, imaplib, anthropic SDK (optional)
@@ -9,29 +9,35 @@ Full Gmail mailbox downloader, AI-powered organizer, and analytics suite. PyQt6 
 - Catppuccin Mocha dark theme
 
 ## Version
-- v1.0.0 — Full power release with all 10 features
+- v1.1.0 — Email preview, search/filter, contacts, HTML archive, large email finder, window persistence
 
 ## Architecture
 - **5-page flow**: Connect -> Download -> Analyze -> Review -> Execute
 - **CategoryEngine**: Domain mapping (150+), List-Unsubscribe + newsletter platform detection, subject patterns, learned rules (feedback loop), clean rules engine, subscription detection, thread building, sensitive scanning
-- **Workers (QThread)**: ImapScanWorker, ImapDownloadWorker, ImapLabelWorker, LocalOrganizeWorker, AttachmentExtractWorker, SensitiveScanWorker, ThreadSummaryWorker, AiClassifyWorker
-- **Dialogs**: StatsDialog (charts + heatmap), SubscriptionDialog (unsubscribe links), RulesEditorDialog (CRUD + Gmail filter import), ThreadSummaryDialog
+- **Workers (QThread)**: ImapScanWorker, ImapDownloadWorker, ImapLabelWorker, LocalOrganizeWorker, AttachmentExtractWorker, SensitiveScanWorker, ThreadSummaryWorker, AiClassifyWorker, HtmlArchiveWorker
+- **Dialogs**: StatsDialog (charts + heatmap + large emails + quota), SubscriptionDialog, RulesEditorDialog, ContactDialog, ThreadSummaryDialog
 - **Custom Widgets**: HBarChart, ActivityHeatmap (QPainter-based, no external deps)
 
-## Features
-1. **Stats Dashboard** — Emails/month bar chart, activity heatmap (day x hour), top senders/domains, category distribution, storage breakdown
-2. **Group-by Views** — Tree view switches between Category, Sender Domain, Sender, Source Folder grouping
-3. **Subscription Scanner** — Detects newsletters via List-Unsubscribe + 25+ platform domains, shows frequency, one-click unsubscribe (opens URL in browser)
-4. **Feedback Loop** — Moving emails teaches the engine (domain->category saved to learned_rules.json). Applied first on next run.
-5. **Auto Clean Rules** — Persistent rules (domain, sender, subject, age, newsletter flag) -> categorize/flag/skip. Gmail filter XML import.
-6. **Attachment Extraction** — Extracts from .eml files, deduplicates by SHA-256, organizes by category
-7. **CSV/JSON Export** — Full metadata export (date, from, subject, category, confidence, folder, size, newsletter, sensitive flags)
-8. **Gmail Filter Import** — Parse Gmail's Atom XML filter export into CleanRules
-9. **Sensitive Content Scanner** — Regex detection of SSN, credit cards, passwords, API keys, GitHub tokens
-10. **Thread Summarization** — Reconstructs threads via In-Reply-To/References headers, sends to Claude Haiku for 2-3 sentence summaries
+## Features (v1.1.0)
+1. **Email Preview Panel** — Click any email to see rendered HTML/text body in a preview pane below the table
+2. **Search & Filter** — Instant keyword search across subject/sender + date range pickers
+3. **Statistics Dashboard** — Emails/month, activity heatmap, top senders/domains, category distribution, storage, large email finder, Gmail quota estimate
+4. **Contact Analysis** — Sortable/filterable contact table with email counts, sent/received split, first/last seen, dormant contact highlighting
+5. **Group-by Views** — Tree view switches between Category, Sender Domain, Sender, Source Folder
+6. **Subscription Scanner** — Detects newsletters via List-Unsubscribe + 25+ platform domains, frequency, one-click unsubscribe
+7. **Feedback Loop** — Moving emails teaches the engine (learned_rules.json). Applied first on next run
+8. **Auto Clean Rules** — Persistent rules engine with CRUD editor + Gmail filter XML import
+9. **Attachment Extraction** — SHA-256 deduplicated, organized by category
+10. **CSV/JSON/HTML Export** — Full metadata export + static browseable HTML archive with per-email pages
+11. **Gmail Filter Import** — Parse Gmail's Atom XML into InboxForge rules
+12. **Sensitive Content Scanner** — SSN, credit cards, passwords, API keys, tokens
+13. **Thread Summarization** — AI summaries of top 50 longest email threads
+14. **Select All / Bulk Move** — Bulk operations on visible emails
+15. **Window State Persistence** — Remembers size, position, last email via QSettings
+16. **Large Email Finder** — Top 20 largest emails surfaced in stats for cleanup
 
 ## Key Files
-- `inboxforge.py` — Single-file app
+- `inboxforge.py` — Single-file app (~2800 lines)
 - `learned_rules.json` — Feedback loop persistence (in download dir)
 - `clean_rules.json` — Auto clean rules (in download dir)
 - `manifest.json` — Download resume tracking (in download dir)
@@ -48,3 +54,5 @@ python inboxforge.py
 - Chart widgets use QPainter (no matplotlib dependency)
 - Sensitive scanner reads first 50KB of each .eml for performance
 - Thread summarization limited to top 50 longest threads, 10 emails each
+- HTML archive renders email bodies with basic HTML — complex emails may not render perfectly in QTextBrowser
+- QSettings stores window geometry and last-used email address

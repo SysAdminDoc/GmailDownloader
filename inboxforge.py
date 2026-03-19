@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""InboxForge v1.0.0 — Full Gmail Mailbox Downloader, AI Organizer & Analytics Suite"""
+"""InboxForge v1.1.0 — Full Gmail Mailbox Downloader, AI Organizer & Analytics Suite"""
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 import sys, os, subprocess
 
@@ -1240,6 +1240,105 @@ class AiClassifyWorker(QThread):
         except Exception as e: self.error.emit(str(e))
 
 
+class HtmlArchiveWorker(QThread):
+    """Generate a static HTML archive from organized emails."""
+    progress = pyqtSignal(int, int); log = pyqtSignal(str)
+    finished_signal = pyqtSignal(str); error = pyqtSignal(str)
+    def __init__(self, engine, out_dir):
+        super().__init__()
+        self.engine, self.out_dir = engine, Path(out_dir)
+        self._stop = False
+    def stop(self): self._stop = True
+    def run(self):
+        try:
+            hdir = self.out_dir / "html_archive"; hdir.mkdir(parents=True, exist_ok=True)
+            cats = sorted(self.engine.categories.items(), key=lambda x: -len(x[1]))
+            total = len(self.engine.emails); done = 0
+
+            # Index page
+            idx_cats = ''.join(f'<li><a href="{sanitize_filename(c,80)}.html">{c}</a> ({len(e):,})</li>' for c,e in cats)
+            s = self.engine.get_summary()
+            idx_html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>InboxForge Archive</title>
+<style>body{{background:#1e1e2e;color:#cdd6f4;font-family:'Segoe UI',sans-serif;max-width:1200px;margin:0 auto;padding:20px}}
+a{{color:#89b4fa;text-decoration:none}}a:hover{{text-decoration:underline}}
+h1{{color:#89b4fa}}h2{{color:#cba6f7}}
+.stats{{display:flex;gap:16px;flex-wrap:wrap;margin:16px 0}}
+.stat{{background:#313244;padding:16px;border-radius:8px;text-align:center;min-width:120px}}
+.stat .val{{font-size:24px;font-weight:bold;color:#89b4fa}}.stat .lbl{{color:#a6adc8;font-size:12px}}
+ul{{list-style:none;padding:0}}li{{padding:8px;border-bottom:1px solid #313244}}
+</style></head><body>
+<h1>InboxForge Archive</h1>
+<div class="stats">
+<div class="stat"><div class="val">{s['total']:,}</div><div class="lbl">Emails</div></div>
+<div class="stat"><div class="val">{len(cats)}</div><div class="lbl">Categories</div></div>
+<div class="stat"><div class="val">{format_size(s['total_size'])}</div><div class="lbl">Total Size</div></div>
+<div class="stat"><div class="val">{s['date_range'][0]}</div><div class="lbl">Oldest</div></div>
+<div class="stat"><div class="val">{s['date_range'][1]}</div><div class="lbl">Newest</div></div>
+</div><h2>Categories</h2><ul>{idx_cats}</ul></body></html>"""
+            with open(hdir / "index.html", 'w', encoding='utf-8') as f: f.write(idx_html)
+
+            # Per-category pages
+            for cat_name, emails in cats:
+                if self._stop: break
+                sorted_emails = sorted(emails, key=lambda e: e.date_parsed or datetime.min, reverse=True)
+                rows = []
+                for em in sorted_emails:
+                    ds = em.date_parsed.strftime("%Y-%m-%d %H:%M") if em.date_parsed else ""
+                    subj = em.subject.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+                    sender = (em.sender_name or em.sender).replace('&','&amp;').replace('<','&lt;')
+                    link = ""
+                    if em.local_path and Path(em.local_path).exists():
+                        # Create individual email page
+                        em_file = sanitize_filename(f"{em.uid.replace(':','_')}",60) + ".html"
+                        em_dir = hdir / "emails"; em_dir.mkdir(exist_ok=True)
+                        try:
+                            with open(em.local_path, 'rb') as ef:
+                                msg = email.message_from_bytes(ef.read())
+                            body = ""
+                            if msg.is_multipart():
+                                for part in msg.walk():
+                                    ct = part.get_content_type()
+                                    if ct == 'text/html':
+                                        body = part.get_payload(decode=True).decode('utf-8',errors='replace'); break
+                                    elif ct == 'text/plain' and not body:
+                                        body = '<pre>' + part.get_payload(decode=True).decode('utf-8',errors='replace').replace('&','&amp;').replace('<','&lt;') + '</pre>'
+                            else:
+                                payload = msg.get_payload(decode=True)
+                                if payload:
+                                    if msg.get_content_type() == 'text/html':
+                                        body = payload.decode('utf-8',errors='replace')
+                                    else:
+                                        body = '<pre>' + payload.decode('utf-8',errors='replace').replace('&','&amp;').replace('<','&lt;') + '</pre>'
+                            em_html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>{subj}</title>
+<style>body{{background:#1e1e2e;color:#cdd6f4;font-family:'Segoe UI',sans-serif;max-width:900px;margin:0 auto;padding:20px}}
+a{{color:#89b4fa}}.meta{{background:#313244;padding:12px;border-radius:8px;margin-bottom:16px}}
+.meta span{{color:#a6adc8}}.body-content{{background:#181825;padding:16px;border-radius:8px;overflow:auto}}
+pre{{white-space:pre-wrap;word-break:break-word}}</style></head><body>
+<p><a href="../{sanitize_filename(cat_name,80)}.html">Back to {cat_name}</a></p>
+<div class="meta"><b>{subj}</b><br><span>From:</span> {sender}<br><span>Date:</span> {ds}<br><span>Folder:</span> {em.source_folder}</div>
+<div class="body-content">{body}</div></body></html>"""
+                            with open(em_dir / em_file, 'w', encoding='utf-8') as ef: ef.write(em_html)
+                            link = f'<a href="emails/{em_file}">view</a>'
+                        except Exception: pass
+                    rows.append(f'<tr><td>{ds}</td><td>{sender}</td><td>{subj}</td><td>{link}</td></tr>')
+                    done += 1
+
+                cat_html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>{cat_name}</title>
+<style>body{{background:#1e1e2e;color:#cdd6f4;font-family:'Segoe UI',sans-serif;max-width:1200px;margin:0 auto;padding:20px}}
+a{{color:#89b4fa;text-decoration:none}}h1{{color:#cba6f7}}
+table{{width:100%;border-collapse:collapse}}th,td{{padding:8px;text-align:left;border-bottom:1px solid #313244}}
+th{{background:#313244;color:#bac2de;position:sticky;top:0}}</style></head><body>
+<p><a href="index.html">Back to Index</a></p>
+<h1>{cat_name} ({len(emails):,})</h1>
+<table><tr><th>Date</th><th>From</th><th>Subject</th><th></th></tr>{''.join(rows)}</table></body></html>"""
+                with open(hdir / f"{sanitize_filename(cat_name,80)}.html", 'w', encoding='utf-8') as f: f.write(cat_html)
+                self.progress.emit(done, total)
+                self.log.emit(f"  {cat_name}: {len(emails):,} emails")
+
+            self.finished_signal.emit(str(hdir))
+        except Exception as e: self.error.emit(str(e))
+
+
 class ConnectionTester(QObject):
     success = pyqtSignal(int); error = pyqtSignal(str)
     def __init__(self, host, addr, pw):
@@ -1406,6 +1505,47 @@ class StatsDialog(QDialog):
             sized = [(k, v) for k, v in sorted(stats['category_sizes'].items(), key=lambda x: -x[1]) if v > 0][:15]
             if sized:
                 cl.addWidget(HBarChart(sized, "Storage by Category (bytes)"))
+
+        # Large email finder
+        large_emails = sorted(engine.emails, key=lambda e: -e.size_bytes)[:20]
+        if large_emails and large_emails[0].size_bytes > 0:
+            lbl = QLabel("Largest Emails")
+            lbl.setStyleSheet(f"font-size:14px; font-weight:bold; color:{C.TEXT}; margin-top:8px;")
+            cl.addWidget(lbl)
+            large_table = QTableWidget()
+            large_table.setColumnCount(4)
+            large_table.setHorizontalHeaderLabels(["Size", "From", "Subject", "Date"])
+            lh = large_table.horizontalHeader()
+            lh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            lh.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+            lh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+            lh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+            large_table.setColumnWidth(1, 150)
+            large_table.verticalHeader().setVisible(False)
+            large_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+            large_table.setMaximumHeight(min(400, len(large_emails) * 28 + 30))
+            large_table.setRowCount(len(large_emails))
+            for r, em in enumerate(large_emails):
+                large_table.setItem(r, 0, QTableWidgetItem(format_size(em.size_bytes)))
+                large_table.setItem(r, 1, QTableWidgetItem(em.sender_name or em.sender))
+                large_table.setItem(r, 2, QTableWidgetItem(em.subject))
+                large_table.setItem(r, 3, QTableWidgetItem(
+                    em.date_parsed.strftime("%Y-%m-%d") if em.date_parsed else ""))
+            cl.addWidget(large_table)
+
+        # Storage quota estimate (Gmail 15GB free tier)
+        if summary['total_size'] > 0:
+            quota_gb = 15
+            used_gb = summary['total_size'] / (1024**3)
+            pct = min(100, int(used_gb / quota_gb * 100))
+            color = C.GREEN if pct < 60 else C.YELLOW if pct < 85 else C.RED
+            lbl = QLabel(f"Gmail Storage Estimate: {used_gb:.1f} GB / {quota_gb} GB ({pct}%)")
+            lbl.setStyleSheet(f"font-size:14px; font-weight:bold; color:{color}; margin-top:8px;")
+            cl.addWidget(lbl)
+            quota_bar = QProgressBar()
+            quota_bar.setMaximum(100); quota_bar.setValue(pct); quota_bar.setFixedHeight(12)
+            quota_bar.setStyleSheet(f"QProgressBar::chunk {{ background-color: {color}; border-radius: 4px; }}")
+            cl.addWidget(quota_bar)
 
         cl.addStretch()
         scroll.setWidget(content)
@@ -1601,6 +1741,87 @@ class RuleEditDialog(QDialog):
             action_value=self.value_combo.currentText(), enabled=self.enabled_check.isChecked())
 
 
+# ─── Contact Analysis Dialog ─────────────────────────────────────────────
+
+class ContactDialog(QDialog):
+    def __init__(self, engine, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Contact Analysis")
+        self.setMinimumSize(850, 550)
+
+        layout = QVBoxLayout(self)
+        # Build contact data
+        contacts = defaultdict(lambda: {'count': 0, 'sent': 0, 'received': 0,
+                                        'first': None, 'last': None, 'domains': set()})
+        user_domain = engine.user_domain
+        for em in engine.emails:
+            key = em.sender_name or em.sender
+            c = contacts[key]
+            c['count'] += 1
+            c['domains'].add(em.sender_domain)
+            if em.source_folder and 'sent' in em.source_folder.lower():
+                c['sent'] += 1
+            else:
+                c['received'] += 1
+            if em.date_parsed:
+                if not c['first'] or em.date_parsed < c['first']: c['first'] = em.date_parsed
+                if not c['last'] or em.date_parsed > c['last']: c['last'] = em.date_parsed
+
+        sorted_contacts = sorted(contacts.items(), key=lambda x: -x[1]['count'])
+
+        info = QLabel(f"{len(contacts):,} unique contacts")
+        info.setStyleSheet(f"color:{C.SUBTEXT0};"); layout.addWidget(info)
+
+        # Filter
+        frow = QHBoxLayout(); frow.addWidget(QLabel("Search:"))
+        self.filter_input = QLineEdit(); self.filter_input.setPlaceholderText("Filter contacts...")
+        self.filter_input.textChanged.connect(lambda: self._filter(sorted_contacts))
+        frow.addWidget(self.filter_input, 1); layout.addLayout(frow)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(["Contact", "Total", "Received", "Sent", "First Seen", "Last Seen"])
+        h = self.table.horizontalHeader()
+        h.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for c in (1,2,3,4,5): h.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSortingEnabled(True)
+        layout.addWidget(self.table)
+
+        self._populate(sorted_contacts)
+
+        close = QPushButton("Close"); close.clicked.connect(self.close)
+        layout.addWidget(close)
+        self._all_contacts = sorted_contacts
+
+    def _populate(self, contacts):
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(min(len(contacts), 500))
+        for row, (name, c) in enumerate(contacts[:500]):
+            self.table.setItem(row, 0, QTableWidgetItem(name))
+            ti = QTableWidgetItem(); ti.setData(Qt.ItemDataRole.DisplayRole, c['count'])
+            self.table.setItem(row, 1, ti)
+            ri = QTableWidgetItem(); ri.setData(Qt.ItemDataRole.DisplayRole, c['received'])
+            self.table.setItem(row, 2, ri)
+            si = QTableWidgetItem(); si.setData(Qt.ItemDataRole.DisplayRole, c['sent'])
+            self.table.setItem(row, 3, si)
+            self.table.setItem(row, 4, QTableWidgetItem(c['first'].strftime("%Y-%m-%d") if c['first'] else ""))
+            self.table.setItem(row, 5, QTableWidgetItem(c['last'].strftime("%Y-%m-%d") if c['last'] else ""))
+            # Color dormant contacts
+            if c['last'] and (datetime.now() - c['last']).days > 365:
+                for col in range(6):
+                    item = self.table.item(row, col)
+                    if item: item.setForeground(QColor(C.OVERLAY0))
+        self.table.setSortingEnabled(True)
+
+    def _filter(self, all_contacts):
+        q = self.filter_input.text().lower()
+        filtered = [(n, c) for n, c in all_contacts if q in n.lower()] if q else all_contacts
+        self._populate(filtered)
+
+
 # ─── UI: Connect Page ────────────────────────────────────────────────────
 
 class ConnectPage(QWidget):
@@ -1752,8 +1973,9 @@ class DownloadPage(QWidget):
 
     def _build_ui(self):
         layout = QVBoxLayout(self); layout.setSpacing(12)
-        QLabel("Downloading Full Mailbox", self).setStyleSheet("font-size:20px;font-weight:bold;")
-        layout.addWidget(self.findChild(QLabel))
+        title = QLabel("Downloading Full Mailbox")
+        title.setStyleSheet("font-size:20px;font-weight:bold;")
+        layout.addWidget(title)
         self.status_label = QLabel("Preparing..."); self.status_label.setStyleSheet(f"color:{C.SUBTEXT0};")
         layout.addWidget(self.status_label)
         self.progress = QProgressBar(); self.progress.setTextVisible(False); self.progress.setFixedHeight(8)
@@ -1903,38 +2125,46 @@ class ReviewPage(QWidget):
 
     def _build_ui(self):
         layout = QVBoxLayout(self); layout.setSpacing(8)
+        self._current_emails = []  # Currently displayed emails (for filtering)
+        self._all_current_emails = []  # Before filter
 
-        # Toolbar
+        # Toolbar row 1
         tb = QHBoxLayout()
         t = QLabel("Review Categories"); t.setStyleSheet("font-size:20px;font-weight:bold;"); tb.addWidget(t)
         tb.addStretch()
         self.summary_lbl = QLabel(""); self.summary_lbl.setStyleSheet(f"color:{C.SUBTEXT0};"); tb.addWidget(self.summary_lbl)
+        layout.addLayout(tb)
 
-        # Toolbar buttons
-        self.stats_btn = QPushButton("Stats"); self.stats_btn.setProperty("secondary", True)
-        self.stats_btn.clicked.connect(self._show_stats); tb.addWidget(self.stats_btn)
-        self.subs_btn = QPushButton("Subscriptions"); self.subs_btn.setProperty("secondary", True)
-        self.subs_btn.clicked.connect(self._show_subs); tb.addWidget(self.subs_btn)
-        self.rules_btn = QPushButton("Rules"); self.rules_btn.setProperty("secondary", True)
-        self.rules_btn.clicked.connect(self._show_rules); tb.addWidget(self.rules_btn)
+        # Toolbar row 2: action buttons
+        tb2 = QHBoxLayout()
+        for name, slot, tip in [
+            ("Stats", self._show_stats, "Mailbox statistics dashboard"),
+            ("Contacts", self._show_contacts, "Contact frequency analysis"),
+            ("Subscriptions", self._show_subs, "Newsletter management"),
+            ("Rules", self._show_rules, "Auto clean rules editor"),
+        ]:
+            b = QPushButton(name); b.setProperty("secondary", True)
+            b.setToolTip(tip); b.clicked.connect(slot); tb2.addWidget(b)
+            if name == "Contacts": self.contacts_btn = b
 
         # Export menu
         self.export_btn = QPushButton("Export"); self.export_btn.setProperty("secondary", True)
         export_menu = QMenu(self)
         export_menu.addAction("CSV", self._export_csv)
         export_menu.addAction("JSON", self._export_json)
-        self.export_btn.setMenu(export_menu); tb.addWidget(self.export_btn)
+        export_menu.addAction("HTML Archive", self._export_html)
+        self.export_btn.setMenu(export_menu); tb2.addWidget(self.export_btn)
 
-        # Scan buttons
-        self.attach_btn = QPushButton("Extract Attachments"); self.attach_btn.setProperty("secondary", True)
-        self.attach_btn.clicked.connect(self._extract_attachments); tb.addWidget(self.attach_btn)
-        self.sensitive_btn = QPushButton("Scan Sensitive"); self.sensitive_btn.setProperty("secondary", True)
-        self.sensitive_btn.clicked.connect(self._scan_sensitive); tb.addWidget(self.sensitive_btn)
+        tb2.addWidget(QLabel("|")); tb2.addWidget(QLabel(""))  # spacer
+        self.attach_btn = QPushButton("Attachments"); self.attach_btn.setProperty("secondary", True)
+        self.attach_btn.clicked.connect(self._extract_attachments); tb2.addWidget(self.attach_btn)
+        self.sensitive_btn = QPushButton("Sensitive"); self.sensitive_btn.setProperty("secondary", True)
+        self.sensitive_btn.clicked.connect(self._scan_sensitive); tb2.addWidget(self.sensitive_btn)
         self.ai_btn = QPushButton("AI Classify"); self.ai_btn.setProperty("secondary", True)
-        self.ai_btn.clicked.connect(self._ai_classify); tb.addWidget(self.ai_btn)
-        self.thread_btn = QPushButton("Summarize Threads"); self.thread_btn.setProperty("secondary", True)
-        self.thread_btn.clicked.connect(self._summarize_threads); tb.addWidget(self.thread_btn)
-        layout.addLayout(tb)
+        self.ai_btn.clicked.connect(self._ai_classify); tb2.addWidget(self.ai_btn)
+        self.thread_btn = QPushButton("Threads"); self.thread_btn.setProperty("secondary", True)
+        self.thread_btn.clicked.connect(self._summarize_threads); tb2.addWidget(self.thread_btn)
+        layout.addLayout(tb2)
 
         # Main content
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1961,10 +2191,36 @@ class ReviewPage(QWidget):
         ll.addLayout(cat_btns)
         splitter.addWidget(left)
 
-        # Right: email table
+        # Right: search + table + preview
         right = QWidget(); rl = QVBoxLayout(right); rl.setContentsMargins(0,0,0,0)
+
+        # Search & filter bar
+        filter_row = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search emails (subject, sender)...")
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.textChanged.connect(self._apply_filter)
+        filter_row.addWidget(self.search_input, 1)
+        filter_row.addWidget(QLabel("From:"))
+        self.date_from = QDateEdit(); self.date_from.setCalendarPopup(True)
+        self.date_from.setDate(QDate(2018, 1, 1))
+        self.date_from.setDisplayFormat("yyyy-MM-dd")
+        self.date_from.dateChanged.connect(self._apply_filter)
+        filter_row.addWidget(self.date_from)
+        filter_row.addWidget(QLabel("To:"))
+        self.date_to = QDateEdit(); self.date_to.setCalendarPopup(True)
+        self.date_to.setDate(QDate.currentDate())
+        self.date_to.setDisplayFormat("yyyy-MM-dd")
+        self.date_to.dateChanged.connect(self._apply_filter)
+        filter_row.addWidget(self.date_to)
+        rl.addLayout(filter_row)
+
         self.email_count_lbl = QLabel(""); self.email_count_lbl.setStyleSheet(f"color:{C.SUBTEXT0};font-size:12px;")
         rl.addWidget(self.email_count_lbl)
+
+        # Vertical splitter: table on top, preview below
+        vsplitter = QSplitter(Qt.Orientation.Vertical)
+
         self.table = QTableWidget(); self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels(["From", "Subject", "Date", "Folder", "Conf", "Flags"])
         h = self.table.horizontalHeader()
@@ -1974,15 +2230,31 @@ class ReviewPage(QWidget):
         self.table.setColumnWidth(0, 170)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.verticalHeader().setVisible(False); rl.addWidget(self.table)
+        self.table.verticalHeader().setVisible(False)
+        self.table.currentCellChanged.connect(self._on_email_selected)
+        vsplitter.addWidget(self.table)
 
-        move_row = QHBoxLayout(); move_row.addWidget(QLabel("Move to:"))
+        # Email preview pane
+        self.preview = QTextBrowser()
+        self.preview.setOpenExternalLinks(True)
+        self.preview.setStyleSheet(
+            f"background:{C.MANTLE}; color:{C.TEXT}; border:1px solid {C.SURFACE0}; "
+            f"border-radius:6px; padding:8px; font-size:13px;")
+        self.preview.setPlaceholderText("Select an email to preview its content")
+        vsplitter.addWidget(self.preview)
+        vsplitter.setSizes([400, 200])
+        rl.addWidget(vsplitter, 1)
+
+        move_row = QHBoxLayout()
+        sel_all_btn = QPushButton("Select All"); sel_all_btn.setProperty("secondary", True)
+        sel_all_btn.clicked.connect(self.table.selectAll); move_row.addWidget(sel_all_btn)
+        move_row.addWidget(QLabel("Move to:"))
         self.move_combo = QComboBox(); self.move_combo.setMinimumWidth(200)
         move_row.addWidget(self.move_combo, 1)
         mv_btn = QPushButton("Move"); mv_btn.setProperty("secondary", True)
         mv_btn.clicked.connect(self._move_emails); move_row.addWidget(mv_btn)
         rl.addLayout(move_row)
-        splitter.addWidget(right); splitter.setSizes([350, 650])
+        splitter.addWidget(right); splitter.setSizes([320, 680])
         layout.addWidget(splitter, 1)
 
         # Bottom execution
@@ -2111,11 +2383,29 @@ class ReviewPage(QWidget):
 
     def _on_tree_click(self, item):
         emails = self._get_emails_for_item(item)
+        self._all_current_emails = emails
+        self._apply_filter()
+
+    def _apply_filter(self, *_):
+        """Filter current email list by search text and date range."""
+        emails = self._all_current_emails
+        q = self.search_input.text().lower().strip()
+        if q:
+            emails = [em for em in emails if q in (em.subject or '').lower()
+                      or q in (em.sender_name or '').lower() or q in (em.sender or '').lower()]
+        d_from = self.date_from.date().toPyDate()
+        d_to = self.date_to.date().toPyDate()
+        from datetime import date as dt_date
+        d_from_dt = datetime(d_from.year, d_from.month, d_from.day)
+        d_to_dt = datetime(d_to.year, d_to.month, d_to.day, 23, 59, 59)
+        emails = [em for em in emails if not em.date_parsed or (d_from_dt <= em.date_parsed <= d_to_dt)]
+        self._current_emails = emails
         self._show_emails(emails)
 
     def _show_emails(self, emails):
         self.email_count_lbl.setText(f"{len(emails):,} emails")
         display = sorted(emails, key=lambda e: e.date_parsed or datetime.min, reverse=True)[:2000]
+        self._display_list = display  # Store for preview lookup
         self.table.setRowCount(len(display))
         for row, em in enumerate(display):
             self.table.setItem(row, 0, QTableWidgetItem(em.sender_name or em.sender))
@@ -2132,6 +2422,50 @@ class ReviewPage(QWidget):
             self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, em.uid)
         if len(emails) > 2000:
             self.email_count_lbl.setText(f"{len(emails):,} emails (showing 2,000)")
+
+    def _on_email_selected(self, row, *_):
+        """Show email preview when a row is selected."""
+        if row < 0 or not hasattr(self, '_display_list') or row >= len(self._display_list):
+            return
+        em = self._display_list[row]
+        if em.local_path and Path(em.local_path).exists():
+            try:
+                with open(em.local_path, 'rb') as f:
+                    msg = email.message_from_bytes(f.read())
+                body = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        ct = part.get_content_type()
+                        if ct == 'text/html':
+                            body = part.get_payload(decode=True).decode('utf-8', errors='replace')
+                            break
+                        elif ct == 'text/plain' and not body:
+                            text = part.get_payload(decode=True).decode('utf-8', errors='replace')
+                            body = f"<pre style='white-space:pre-wrap;word-break:break-word;color:{C.TEXT};font-family:Segoe UI,sans-serif'>{text}</pre>"
+                else:
+                    payload = msg.get_payload(decode=True)
+                    if payload:
+                        if msg.get_content_type() == 'text/html':
+                            body = payload.decode('utf-8', errors='replace')
+                        else:
+                            text = payload.decode('utf-8', errors='replace')
+                            body = f"<pre style='white-space:pre-wrap;word-break:break-word;color:{C.TEXT};font-family:Segoe UI,sans-serif'>{text}</pre>"
+                header = (f"<div style='background:{C.SURFACE0};padding:10px;border-radius:6px;margin-bottom:10px'>"
+                          f"<b style='color:{C.BLUE}'>{em.subject}</b><br>"
+                          f"<span style='color:{C.SUBTEXT0}'>From:</span> {em.sender_name} &lt;{em.sender}&gt;<br>"
+                          f"<span style='color:{C.SUBTEXT0}'>Date:</span> {em.date}<br>"
+                          f"<span style='color:{C.SUBTEXT0}'>Folder:</span> {em.source_folder}</div>")
+                self.preview.setHtml(header + body)
+            except Exception as e:
+                self.preview.setPlainText(f"Error loading email: {e}")
+        else:
+            self.preview.setHtml(
+                f"<div style='background:{C.SURFACE0};padding:10px;border-radius:6px'>"
+                f"<b style='color:{C.BLUE}'>{em.subject}</b><br>"
+                f"<span style='color:{C.SUBTEXT0}'>From:</span> {em.sender_name} &lt;{em.sender}&gt;<br>"
+                f"<span style='color:{C.SUBTEXT0}'>Date:</span> {em.date}<br>"
+                f"<span style='color:{C.SUBTEXT0}'>Folder:</span> {em.source_folder}<br><br>"
+                f"<i style='color:{C.OVERLAY0}'>Email body not available (headers-only scan mode)</i></div>")
 
     def _ctx_menu(self, pos):
         item = self.cat_tree.itemAt(pos)
@@ -2181,6 +2515,9 @@ class ReviewPage(QWidget):
     def _show_stats(self):
         if self.engine: StatsDialog(self.engine, self).exec()
 
+    def _show_contacts(self):
+        if self.engine: ContactDialog(self.engine, self).exec()
+
     def _show_subs(self):
         if self.engine: SubscriptionDialog(self.engine.subscriptions, self).exec()
 
@@ -2191,12 +2528,32 @@ class ReviewPage(QWidget):
     def _export_csv(self):
         if not self.engine: return
         p, _ = QFileDialog.getSaveFileName(self, "Export CSV", "inboxforge_export.csv", "CSV (*.csv)")
-        if p: self.engine.export_csv(p)
+        if p:
+            self.engine.export_csv(p)
+            QMessageBox.information(self, "Exported", f"Exported {len(self.engine.emails):,} emails to CSV")
 
     def _export_json(self):
         if not self.engine: return
         p, _ = QFileDialog.getSaveFileName(self, "Export JSON", "inboxforge_export.json", "JSON (*.json)")
-        if p: self.engine.export_json(p)
+        if p:
+            self.engine.export_json(p)
+            QMessageBox.information(self, "Exported", f"Exported {len(self.engine.emails):,} emails to JSON")
+
+    def _export_html(self):
+        if not self.engine or not self._dl_dir: return
+        self.export_btn.setEnabled(False)
+        self._html_w = HtmlArchiveWorker(self.engine, self._dl_dir)
+        self._html_w.log.connect(lambda s: None)  # Silent
+        self._html_w.finished_signal.connect(self._html_done)
+        self._html_w.error.connect(lambda e: (self.export_btn.setEnabled(True),
+            QMessageBox.warning(self, "Error", e)))
+        self._html_w.start()
+
+    def _html_done(self, path):
+        self.export_btn.setEnabled(True)
+        QMessageBox.information(self, "HTML Archive",
+            f"Generated browseable HTML archive at:\n{path}\n\nOpen index.html to browse.")
+        os.startfile(path)
 
     def _extract_attachments(self):
         if not self.engine or not self._dl_dir: return
@@ -2365,6 +2722,14 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(f"InboxForge v{VERSION}")
         self.setMinimumSize(1000, 650); self.resize(1200, 800)
+
+        # Restore window state
+        self._settings = QSettings("InboxForge", "InboxForge")
+        geo = self._settings.value("geometry")
+        if geo: self.restoreGeometry(geo)
+        state = self._settings.value("windowState")
+        if state: self.restoreState(state)
+
         self.stack = QStackedWidget(); self.setCentralWidget(self.stack)
         self.cp = ConnectPage(); self.dp = DownloadPage()
         self.ap = AnalyzePage(); self.rp = ReviewPage(); self.ep = ExecutePage()
@@ -2374,6 +2739,16 @@ class MainWindow(QMainWindow):
         self.dp.download_complete.connect(self._dl_done)
         self.ap.analysis_complete.connect(self._review)
         self.rp.execute_requested.connect(self._execute)
+
+        # Restore last email
+        last_email = self._settings.value("last_email", "")
+        if last_email: self.cp.email_input.setText(last_email)
+
+    def closeEvent(self, event):
+        self._settings.setValue("geometry", self.saveGeometry())
+        self._settings.setValue("windowState", self.saveState())
+        self._settings.setValue("last_email", self.cp.email_input.text())
+        super().closeEvent(event)
 
     def _connected(self, mode):
         if mode == "load":
