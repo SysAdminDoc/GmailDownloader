@@ -1,5 +1,7 @@
 # InboxForge
 
+![Version](https://img.shields.io/badge/version-v1.1.0-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Platform](https://img.shields.io/badge/platform-Python-lightgrey)
+
 Full Gmail mailbox downloader, AI-powered organizer, and analytics suite. Download your entire Gmail as `.eml` files, auto-categorize with 150+ domain mappings and Claude AI, then organize locally — without ever modifying your live mailbox.
 
 ## Features
