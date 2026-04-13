@@ -1,4 +1,4 @@
-# InboxForge
+# GmailDownloader
 
 ![Version](https://img.shields.io/badge/version-v1.1.0-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Platform](https://img.shields.io/badge/platform-Python-lightgrey)
 
@@ -25,7 +25,7 @@ Full Gmail mailbox downloader, AI-powered organizer, and analytics suite. Downlo
 
 ### Power Tools
 - **Auto Clean Rules** — Persistent rules engine (domain, sender, subject, age, newsletter flag) with CRUD editor
-- **Gmail Filter Import** — Parse Gmail's filter export XML into InboxForge rules
+- **Gmail Filter Import** — Parse Gmail's filter export XML into GmailDownloader rules
 - **Attachment Extraction** — Pulls all attachments from `.eml` files, deduplicates by SHA-256, organizes by category
 - **Sensitive Content Scanner** — Detects SSNs, credit card numbers, passwords, API keys, and tokens in email bodies
 - **Thread Summarization** — Reconstructs email threads via `In-Reply-To`/`References` headers, generates 2-3 sentence AI summaries
@@ -40,7 +40,7 @@ Full Gmail mailbox downloader, AI-powered organizer, and analytics suite. Downlo
 ## Usage
 
 ```bash
-python inboxforge.py
+python gmaildownloader.py
 ```
 
 Dependencies (`PyQt6`, `anthropic`) are auto-installed on first run.
@@ -56,7 +56,7 @@ Dependencies (`PyQt6`, `anthropic`) are auto-installed on first run.
 ### Output Structure
 
 ```
-InboxForge/
+GmailDownloader/
 ├── folders/              # Original Gmail structure
 │   ├── INBOX/
 │   ├── Sent Mail/

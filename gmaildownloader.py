@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""InboxForge v1.1.0 — Full Gmail Mailbox Downloader, AI Organizer & Analytics Suite"""
+"""GmailDownloader v1.1.0 — Full Gmail Mailbox Downloader, AI Organizer & Analytics Suite"""
 
 VERSION = "1.1.0"
 
@@ -1258,7 +1258,7 @@ class HtmlArchiveWorker(QThread):
             # Index page
             idx_cats = ''.join(f'<li><a href="{sanitize_filename(c,80)}.html">{c}</a> ({len(e):,})</li>' for c,e in cats)
             s = self.engine.get_summary()
-            idx_html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>InboxForge Archive</title>
+            idx_html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>GmailDownloader Archive</title>
 <style>body{{background:#1e1e2e;color:#cdd6f4;font-family:'Segoe UI',sans-serif;max-width:1200px;margin:0 auto;padding:20px}}
 a{{color:#89b4fa;text-decoration:none}}a:hover{{text-decoration:underline}}
 h1{{color:#89b4fa}}h2{{color:#cba6f7}}
@@ -1267,7 +1267,7 @@ h1{{color:#89b4fa}}h2{{color:#cba6f7}}
 .stat .val{{font-size:24px;font-weight:bold;color:#89b4fa}}.stat .lbl{{color:#a6adc8;font-size:12px}}
 ul{{list-style:none;padding:0}}li{{padding:8px;border-bottom:1px solid #313244}}
 </style></head><body>
-<h1>InboxForge Archive</h1>
+<h1>GmailDownloader Archive</h1>
 <div class="stats">
 <div class="stat"><div class="val">{s['total']:,}</div><div class="lbl">Emails</div></div>
 <div class="stat"><div class="val">{len(cats)}</div><div class="lbl">Categories</div></div>
@@ -1836,7 +1836,7 @@ class ConnectPage(QWidget):
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter); layout.setSpacing(16)
-        title = QLabel("InboxForge")
+        title = QLabel("GmailDownloader")
         title.setStyleSheet(f"font-size:32px; color:{C.BLUE}; font-weight:bold;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter); layout.addWidget(title)
         sub = QLabel(f"v{VERSION} — Full Gmail Mailbox Downloader, AI Organizer & Analytics")
@@ -1894,7 +1894,7 @@ class ConnectPage(QWidget):
             self.status_label.setStyleSheet(f"color:{C.RED};"); return
         if mode == "download":
             f = QFileDialog.getExistingDirectory(self, "Download Folder",
-                str(Path.home() / "Desktop" / "InboxForge"))
+                str(Path.home() / "Desktop" / "GmailDownloader"))
             if not f: return
             self.download_dir = f
         self.status_label.setText("Testing..."); self.status_label.setStyleSheet(f"color:{C.YELLOW};")
@@ -2108,7 +2108,7 @@ class AnalyzePage(QWidget):
         self.cont_btn.setVisible(True); self.save_btn.setVisible(True); self.stats_btn.setVisible(True)
 
     def _save(self):
-        p, _ = QFileDialog.getSaveFileName(self, "Save", "inboxforge_scan.json", "JSON (*.json)")
+        p, _ = QFileDialog.getSaveFileName(self, "Save", "gmaildownloader_scan.json", "JSON (*.json)")
         if p and self.engine: self.engine.save_state(p)
 
     def _show_stats(self):
@@ -2527,14 +2527,14 @@ class ReviewPage(QWidget):
 
     def _export_csv(self):
         if not self.engine: return
-        p, _ = QFileDialog.getSaveFileName(self, "Export CSV", "inboxforge_export.csv", "CSV (*.csv)")
+        p, _ = QFileDialog.getSaveFileName(self, "Export CSV", "gmaildownloader_export.csv", "CSV (*.csv)")
         if p:
             self.engine.export_csv(p)
             QMessageBox.information(self, "Exported", f"Exported {len(self.engine.emails):,} emails to CSV")
 
     def _export_json(self):
         if not self.engine: return
-        p, _ = QFileDialog.getSaveFileName(self, "Export JSON", "inboxforge_export.json", "JSON (*.json)")
+        p, _ = QFileDialog.getSaveFileName(self, "Export JSON", "gmaildownloader_export.json", "JSON (*.json)")
         if p:
             self.engine.export_json(p)
             QMessageBox.information(self, "Exported", f"Exported {len(self.engine.emails):,} emails to JSON")
@@ -2720,11 +2720,11 @@ class ExecutePage(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"InboxForge v{VERSION}")
+        self.setWindowTitle(f"GmailDownloader v{VERSION}")
         self.setMinimumSize(1000, 650); self.resize(1200, 800)
 
         # Restore window state
-        self._settings = QSettings("InboxForge", "InboxForge")
+        self._settings = QSettings("GmailDownloader", "GmailDownloader")
         geo = self._settings.value("geometry")
         if geo: self.restoreGeometry(geo)
         state = self._settings.value("windowState")
@@ -2778,7 +2778,7 @@ class MainWindow(QMainWindow):
             if not any(em.local_path and Path(em.local_path).exists() for es in cats.values() for em in es):
                 QMessageBox.warning(self, "No Files", "Download mailbox first."); return
             self.stack.setCurrentWidget(self.ep)
-            self.ep.start_local(cats, self._dl_dir or str(Path.home()/"Desktop"/"InboxForge"),
+            self.ep.start_local(cats, self._dl_dir or str(Path.home()/"Desktop"/"GmailDownloader"),
                 self.rp.copy_radio.isChecked())
         else:
             if not self.cp.email_addr or not self.cp.password:

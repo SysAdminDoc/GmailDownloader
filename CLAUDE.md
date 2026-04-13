@@ -1,11 +1,11 @@
-# InboxForge
+# GmailDownloader
 
 ## Overview
 Full Gmail mailbox downloader, AI-powered organizer, and analytics suite. PyQt6 GUI with 16+ features including email preview, search/filter, statistics dashboard, contact analysis, subscription manager, HTML archive export, and more.
 
 ## Tech Stack
 - Python 3, PyQt6, imaplib, anthropic SDK (optional)
-- Single-file: `inboxforge.py` with `_bootstrap()` auto-install
+- Single-file: `gmaildownloader.py` with `_bootstrap()` auto-install
 - Catppuccin Mocha dark theme
 
 ## Version
@@ -29,7 +29,7 @@ Full Gmail mailbox downloader, AI-powered organizer, and analytics suite. PyQt6 
 8. **Auto Clean Rules** — Persistent rules engine with CRUD editor + Gmail filter XML import
 9. **Attachment Extraction** — SHA-256 deduplicated, organized by category
 10. **CSV/JSON/HTML Export** — Full metadata export + static browseable HTML archive with per-email pages
-11. **Gmail Filter Import** — Parse Gmail's Atom XML into InboxForge rules
+11. **Gmail Filter Import** — Parse Gmail's Atom XML into GmailDownloader rules
 12. **Sensitive Content Scanner** — SSN, credit cards, passwords, API keys, tokens
 13. **Thread Summarization** — AI summaries of top 50 longest email threads
 14. **Select All / Bulk Move** — Bulk operations on visible emails
@@ -37,14 +37,14 @@ Full Gmail mailbox downloader, AI-powered organizer, and analytics suite. PyQt6 
 16. **Large Email Finder** — Top 20 largest emails surfaced in stats for cleanup
 
 ## Key Files
-- `inboxforge.py` — Single-file app (~2800 lines)
+- `gmaildownloader.py` — Single-file app (~2800 lines)
 - `learned_rules.json` — Feedback loop persistence (in download dir)
 - `clean_rules.json` — Auto clean rules (in download dir)
 - `manifest.json` — Download resume tracking (in download dir)
 
 ## Run
 ```bash
-python inboxforge.py
+python gmaildownloader.py
 ```
 
 ## Gotchas
