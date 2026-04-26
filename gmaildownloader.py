@@ -5,6 +5,25 @@ VERSION = "1.1.0"
 
 import sys, os, subprocess
 
+
+# codex-branding:start
+def _branding_icon_path() -> Path:
+    candidates = []
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        candidates.append(exe_dir / "icon.png")
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "icon.png")
+    current = Path(__file__).resolve()
+    candidates.extend([current.parent / "icon.png", current.parent.parent / "icon.png", current.parent.parent.parent / "icon.png"])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return Path("icon.png")
+# codex-branding:end
+
+
 def _bootstrap():
     deps = {'PyQt6': 'PyQt6', 'anthropic': 'anthropic'}
     for imp_name, pkg_name in deps.items():
@@ -42,7 +61,7 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import *
-from PyQt6.QtGui import *
+from PyQt6.QtGui import *, QIcon
 
 try:
     import anthropic
@@ -2790,7 +2809,9 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv); app.setStyleSheet(STYLESHEET); app.setStyle("Fusion")
+    branding_icon = QIcon(str(_branding_icon_path()))
+    app.setWindowIcon(branding_icon)
     w = MainWindow(); w.show(); sys.exit(app.exec())
-
+    w.setWindowIcon(branding_icon)
 if __name__ == "__main__":
     main()
