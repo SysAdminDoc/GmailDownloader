@@ -2,8 +2,40 @@
 """GmailDownloader v1.1.0 — Full Gmail Mailbox Downloader, AI Organizer & Analytics Suite"""
 
 VERSION = "1.1.0"
+MANIFEST_VERSION = 2
+MANIFEST_FILENAME = "manifest.json"
 
-import sys, os, subprocess
+import base64
+import calendar
+import csv
+import email
+import email.header
+import email.policy
+import email.utils
+from email.generator import BytesGenerator
+from email.message import EmailMessage
+import hashlib
+import html
+import imaplib
+import io
+import json
+import mailbox
+import mimetypes
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 
 
@@ -41,21 +73,8 @@ def _bootstrap():
 
 _bootstrap()
 
-import imaplib
-import email
-import email.header
-import email.utils
-import re
-import csv
-import io
-import json
-import shutil
-import hashlib
-import webbrowser
-import traceback
-import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from dataclasses import dataclass, field
 from typing import Optional
 from PyQt6.QtWidgets import *
@@ -263,6 +282,34 @@ class EmailInfo:
     size_bytes: int = 0
     sensitive_flags: list = field(default_factory=list)
     is_newsletter: bool = False
+    account: str = ""
+    has_attachments: bool = False
+    attachment_names: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SyncOptions:
+    """Controls a source sync without coupling the UI to a provider."""
+
+    since: Optional[datetime] = None
+    incremental: bool = True
+    verify_integrity: bool = True
+    attachments_only: bool = False
+    max_message_size: int = 0
+
+
+@dataclass
+class AccountConfig:
+    """Serializable account settings used by multi-account orchestration."""
+
+    name: str
+    address: str
+    host: str = "imap.gmail.com"
+    port: int = 993
+    use_ssl: bool = True
+    auth_mode: str = "password"
+    secret: str = ""
+    output_dir: str = ""
 
 @dataclass
 class CleanRule:
@@ -710,16 +757,7 @@ class CategoryEngine:
 
     def save_state(self, path: str):
         data = {'version': VERSION, 'user_domain': self.user_domain,
-                'emails': [{'uid': em.uid, 'sender': em.sender, 'sender_name': em.sender_name,
-                    'sender_domain': em.sender_domain, 'subject': em.subject,
-                    'date': em.date, 'has_list_unsubscribe': em.has_list_unsubscribe,
-                    'list_unsubscribe_url': em.list_unsubscribe_url,
-                    'category': em.category, 'confidence': em.confidence,
-                    'local_path': em.local_path, 'source_folder': em.source_folder,
-                    'message_id': em.message_id, 'in_reply_to': em.in_reply_to,
-                    'references': em.references, 'size_bytes': em.size_bytes,
-                    'sensitive_flags': em.sensitive_flags, 'is_newsletter': em.is_newsletter}
-                   for em in self.emails]}
+                'emails': [email_info_to_record(em) for em in self.emails]}
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False)
 
@@ -731,18 +769,9 @@ class CategoryEngine:
             self.emails = []
             self.categories.clear()
             for ed in data.get('emails', []):
-                em = EmailInfo(uid=ed['uid'], sender=ed.get('sender',''),
-                    sender_name=ed.get('sender_name',''), sender_domain=ed.get('sender_domain',''),
-                    subject=ed.get('subject',''), date=ed.get('date',''),
-                    date_parsed=parse_date(ed.get('date','')),
-                    has_list_unsubscribe=ed.get('has_list_unsubscribe',False),
-                    list_unsubscribe_url=ed.get('list_unsubscribe_url',''),
-                    category=ed.get('category',''), confidence=ed.get('confidence',0),
-                    local_path=ed.get('local_path',''), source_folder=ed.get('source_folder',''),
-                    message_id=ed.get('message_id',''), in_reply_to=ed.get('in_reply_to',''),
-                    references=ed.get('references',''), size_bytes=ed.get('size_bytes',0),
-                    sensitive_flags=ed.get('sensitive_flags',[]),
-                    is_newsletter=ed.get('is_newsletter',False))
+                em = email_info_from_record(
+                    ed.get('uid', ''), ed, ed.get('source_folder', ''), ed.get('account', '')
+                )
                 self.emails.append(em)
                 if em.category:
                     self.categories[em.category].append(em)
@@ -803,6 +832,494 @@ def format_size(b):
     if b < 1024**2: return f"{b/1024:.1f} KB"
     if b < 1024**3: return f"{b/1024**2:.1f} MB"
     return f"{b/1024**3:.1f} GB"
+
+
+def new_manifest():
+    """Return the current manifest shape used by resumable downloads."""
+    return {
+        'version': MANIFEST_VERSION,
+        'folders': {},
+        'message_ids': {},
+        'folder_metadata': {},
+        'sync': {},
+    }
+
+
+def normalize_manifest(manifest):
+    """Upgrade old manifests in memory while preserving their message records."""
+    if not isinstance(manifest, dict):
+        return new_manifest()
+    normalized = new_manifest()
+    normalized.update(manifest)
+    normalized['version'] = max(int(manifest.get('version', 1) or 1), MANIFEST_VERSION)
+    normalized['folders'] = manifest.get('folders', {}) if isinstance(manifest.get('folders', {}), dict) else {}
+    normalized['message_ids'] = manifest.get('message_ids', {}) if isinstance(manifest.get('message_ids', {}), dict) else {}
+    normalized['folder_metadata'] = manifest.get('folder_metadata', {}) if isinstance(manifest.get('folder_metadata', {}), dict) else {}
+    normalized['sync'] = manifest.get('sync', {}) if isinstance(manifest.get('sync', {}), dict) else {}
+    return normalized
+
+
+def load_manifest(path):
+    """Load and normalize a manifest, raising only for unreadable JSON."""
+    path = Path(path)
+    if not path.exists():
+        return new_manifest()
+    with path.open('r', encoding='utf-8') as fh:
+        return normalize_manifest(json.load(fh))
+
+
+def save_manifest(path, manifest):
+    """Atomically persist a manifest so an interrupted sync cannot truncate it."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(normalize_manifest(manifest), ensure_ascii=False, indent=2)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix='.tmp', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='') as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def sha256_file(path, chunk_size=1024 * 1024):
+    """Return a streaming SHA-256 digest for a local archive file."""
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as fh:
+        while True:
+            chunk = fh.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def resolve_manifest_path(path, root):
+    path = Path(path)
+    return path if path.is_absolute() else Path(root) / path
+
+
+def validate_manifest(manifest, root, update_missing=False):
+    """Validate recorded files and return a list of actionable integrity issues.
+
+    Legacy manifests did not contain hashes. When ``update_missing`` is true,
+    hashes are filled in for existing files so the next resume has integrity
+    protection without forcing a needless full re-download.
+    """
+    issues = []
+    root = Path(root)
+    for folder, records in manifest.get('folders', {}).items():
+        if not isinstance(records, dict):
+            continue
+        for uid, info in records.items():
+            if not isinstance(info, dict):
+                issues.append({'folder': folder, 'uid': uid, 'reason': 'invalid record'})
+                continue
+            local_path = info.get('local_path', '')
+            if not local_path:
+                continue
+            path = resolve_manifest_path(local_path, root)
+            if not path.exists() or not path.is_file():
+                issues.append({'folder': folder, 'uid': uid, 'reason': 'missing file', 'path': str(path)})
+                continue
+            expected = info.get('sha256', '')
+            if expected:
+                try:
+                    actual = sha256_file(path)
+                except OSError as exc:
+                    issues.append({'folder': folder, 'uid': uid, 'reason': str(exc), 'path': str(path)})
+                    continue
+                if actual.lower() != str(expected).lower():
+                    issues.append({'folder': folder, 'uid': uid, 'reason': 'sha256 mismatch', 'path': str(path)})
+            elif update_missing:
+                try:
+                    info['sha256'] = sha256_file(path)
+                except OSError as exc:
+                    issues.append({'folder': folder, 'uid': uid, 'reason': str(exc), 'path': str(path)})
+    return issues
+
+
+def email_info_from_record(uid, info, source_folder='', account=''):
+    """Create an :class:`EmailInfo` from a manifest or API record."""
+    info = info or {}
+    date_value = info.get('date', '')
+    return EmailInfo(
+        uid=uid,
+        sender=info.get('sender', ''),
+        sender_name=info.get('sender_name', ''),
+        sender_domain=info.get('sender_domain', ''),
+        subject=info.get('subject', ''),
+        date=date_value,
+        date_parsed=parse_date(date_value),
+        has_list_unsubscribe=info.get('has_list_unsubscribe', False),
+        list_unsubscribe_url=info.get('list_unsubscribe_url', ''),
+        category=info.get('category', ''),
+        confidence=info.get('confidence', 0.0),
+        local_path=info.get('local_path', ''),
+        source_folder=source_folder or info.get('source_folder', ''),
+        message_id=info.get('message_id', ''),
+        in_reply_to=info.get('in_reply_to', ''),
+        references=info.get('references', ''),
+        size_bytes=info.get('size_bytes', 0),
+        sensitive_flags=info.get('sensitive_flags', []),
+        is_newsletter=info.get('is_newsletter', False),
+        account=account or info.get('account', ''),
+        has_attachments=info.get('has_attachments', False),
+        attachment_names=info.get('attachment_names', []),
+    )
+
+
+def email_info_to_record(em):
+    return {
+        'sender': em.sender,
+        'sender_name': em.sender_name,
+        'sender_domain': em.sender_domain,
+        'subject': em.subject,
+        'date': em.date,
+        'has_list_unsubscribe': em.has_list_unsubscribe,
+        'list_unsubscribe_url': em.list_unsubscribe_url,
+        'category': em.category,
+        'confidence': em.confidence,
+        'local_path': em.local_path,
+        'source_folder': em.source_folder,
+        'message_id': em.message_id,
+        'in_reply_to': em.in_reply_to,
+        'references': em.references,
+        'size_bytes': em.size_bytes,
+        'sensitive_flags': em.sensitive_flags,
+        'is_newsletter': em.is_newsletter,
+        'account': em.account,
+        'has_attachments': em.has_attachments,
+        'attachment_names': em.attachment_names,
+    }
+
+
+def parse_email_message(raw, uid, source_folder='', local_path='', account=''):
+    """Parse headers once for all mailbox providers."""
+    msg = email.message_from_bytes(raw, policy=email.policy.default)
+    from_header = decode_header(msg.get('From', ''))
+    sender_name, sender = email.utils.parseaddr(from_header)
+    unsubscribe = decode_header(msg.get('List-Unsubscribe', ''))
+    attachment_names = []
+    for part in msg.walk():
+        filename = part.get_filename()
+        if filename:
+            attachment_names.append(decode_header(filename))
+    date_value = decode_header(msg.get('Date', ''))
+    return EmailInfo(
+        uid=str(uid),
+        sender=sender or from_header,
+        sender_name=sender_name or sender or from_header,
+        subject=decode_header(msg.get('Subject', '(no subject)')),
+        date=date_value,
+        date_parsed=parse_date(date_value),
+        has_list_unsubscribe=bool(unsubscribe),
+        list_unsubscribe_url=unsubscribe,
+        local_path=str(local_path),
+        source_folder=source_folder,
+        message_id=decode_header(msg.get('Message-ID', '')),
+        in_reply_to=decode_header(msg.get('In-Reply-To', '')),
+        references=decode_header(msg.get('References', '')),
+        size_bytes=len(raw),
+        account=account,
+        has_attachments=bool(attachment_names),
+        attachment_names=attachment_names,
+    )
+
+
+def parse_since_date(value):
+    if value in (None, ''):
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+    for fmt in ('%Y-%m-%d', '%d-%b-%Y', '%Y/%m/%d'):
+        try:
+            return datetime.strptime(str(value), fmt)
+        except ValueError:
+            continue
+    raise ValueError(f"Unsupported since date: {value}")
+
+
+def imap_since_query(value):
+    parsed = parse_since_date(value)
+    return parsed.strftime('%d-%b-%Y') if parsed else None
+
+
+def extract_message_body(msg, max_bytes=0):
+    """Return the preferred readable body, preferring plain text over HTML."""
+    candidates = []
+    parts = msg.walk() if msg.is_multipart() else [msg]
+    for part in parts:
+        content_type = part.get_content_type()
+        if content_type not in ('text/plain', 'text/html'):
+            continue
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            continue
+        charset = part.get_content_charset() or 'utf-8'
+        text_value = payload.decode(charset, errors='replace')
+        if content_type == 'text/plain':
+            candidates.insert(0, text_value)
+        else:
+            candidates.append(re.sub(r'<[^>]+>', ' ', text_value))
+    body = next((candidate for candidate in candidates if candidate.strip()), '')
+    return body[:max_bytes] if max_bytes else body
+
+
+def extract_attachments(msg):
+    attachments = []
+    for part in msg.walk():
+        filename = part.get_filename()
+        payload = part.get_payload(decode=True)
+        if not filename or not payload:
+            continue
+        attachments.append((decode_header(filename), payload, part.get_content_type()))
+    return attachments
+
+
+def extract_attachments_to(raw, output_dir, category='Uncategorized', seen_hashes=None, date_value=None):
+    """Extract and SHA-256 deduplicate attachments from one raw message."""
+    output_dir = Path(output_dir)
+    attachment_dir = output_dir / 'attachments' / sanitize_filename(category, 60)
+    attachment_dir.mkdir(parents=True, exist_ok=True)
+    seen_hashes = seen_hashes if seen_hashes is not None else {}
+    msg = email.message_from_bytes(raw, policy=email.policy.default)
+    written = []
+    for filename, payload, _ in extract_attachments(msg):
+        digest = hashlib.sha256(payload).hexdigest()
+        if digest in seen_hashes:
+            continue
+        seen_hashes[digest] = filename
+        safe_name = sanitize_filename(filename, 100)
+        prefix = date_value.strftime('%Y-%m-%d') + '_' if date_value else ''
+        target = attachment_dir / f'{prefix}{safe_name}'
+        suffix = 1
+        stem, extension = target.stem, target.suffix
+        while target.exists():
+            target = attachment_dir / f'{stem}_{suffix}{extension}'
+            suffix += 1
+        target.write_bytes(payload)
+        written.append((str(target), digest, len(payload)))
+    return written
+
+
+def import_mbox(mbox_path, output_dir=None, folder_name=None, attachments_only=False):
+    """Import a Google Takeout or generic mbox into ``EmailInfo`` records."""
+    mbox_path = Path(mbox_path)
+    folder_name = folder_name or mbox_path.stem or 'Imported'
+    output_dir = Path(output_dir) if output_dir else None
+    folder_dir = output_dir / 'folders' / sanitize_folder_name(folder_name) if output_dir else None
+    if folder_dir:
+        folder_dir.mkdir(parents=True, exist_ok=True)
+    result = []
+    seen_hashes = {}
+    box = mailbox.mbox(str(mbox_path), create=False)
+    try:
+        for index, (key, message) in enumerate(box.iteritems()):
+            raw = message.as_bytes(policy=email.policy.SMTP)
+            local_path = ''
+            if output_dir and not attachments_only:
+                local_path = str(folder_dir / f'{index:08d}.eml')
+                Path(local_path).write_bytes(raw)
+            if output_dir and attachments_only:
+                extract_attachments_to(raw, output_dir, date_value=parse_email_message(raw, key, folder_name).date_parsed,
+                                       seen_hashes=seen_hashes)
+            result.append(parse_email_message(raw, f'{folder_name}:{key}', folder_name, local_path))
+    finally:
+        box.close()
+    return result
+
+
+def import_thunderbird_profile(profile_path, output_dir=None):
+    """Import mbox files below a Thunderbird profile, skipping ``.msf`` indexes."""
+    profile_path = Path(profile_path)
+    roots = [p for p in (profile_path / 'ImapMail', profile_path / 'Mail') if p.exists()]
+    if not roots:
+        roots = [profile_path]
+    result = []
+    for root in roots:
+        for candidate in sorted(root.rglob('*')):
+            if not candidate.is_file() or candidate.name.endswith('.msf'):
+                continue
+            try:
+                relative = candidate.relative_to(root).with_suffix('')
+                folder = str(relative).replace(os.sep, '/')
+                imported = import_mbox(candidate, output_dir, folder or candidate.stem)
+                result.extend(imported)
+            except (OSError, ValueError, mailbox.Error):
+                continue
+    return result
+
+
+def build_xoauth2_string(address, access_token):
+    """Build the SASL XOAUTH2 initial client response used by Gmail IMAP."""
+    return f'user={address}\x01auth=Bearer {access_token}\x01\x01'.encode('utf-8')
+
+
+def open_imap_connection(host, port=993, use_ssl=True, address='', secret='',
+                         auth_mode='password', access_token=''):
+    """Open a password or XOAUTH2 IMAP connection for Gmail and generic IMAP."""
+    if use_ssl:
+        connection = imaplib.IMAP4_SSL(host, port)
+    else:
+        connection = imaplib.IMAP4(host, port)
+    if auth_mode.lower() in ('oauth2', 'xoauth2', 'token'):
+        token = access_token or secret
+        if not token:
+            raise ValueError('An OAuth2 access token is required')
+        connection.authenticate('XOAUTH2', lambda _: build_xoauth2_string(address, token))
+    else:
+        connection.login(address, secret)
+    return connection
+
+
+def imap_uidvalidity(imap):
+    """Read UIDVALIDITY when the server exposes it, returning an empty string otherwise."""
+    try:
+        _, response = imap.response('UIDVALIDITY')
+        if response:
+            raw = response[0] if isinstance(response, (list, tuple)) else response
+            match = re.search(rb'\d+', raw if isinstance(raw, bytes) else str(raw).encode())
+            if match:
+                return match.group().decode()
+    except Exception:
+        pass
+    return ''
+
+
+def export_mbox(emails, output_path):
+    """Write local EML messages to an interoperable mbox file."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    box = mailbox.mbox(str(output_path), create=True)
+    try:
+        for em in emails:
+            raw = b''
+            if em.local_path and Path(em.local_path).exists():
+                raw = Path(em.local_path).read_bytes()
+            if raw:
+                box.add(email.message_from_bytes(raw, policy=email.policy.default))
+                continue
+            msg = EmailMessage()
+            if em.subject:
+                msg['Subject'] = em.subject
+            if em.sender:
+                msg['From'] = em.sender
+            if em.date:
+                msg['Date'] = em.date
+            if em.message_id:
+                msg['Message-ID'] = em.message_id
+            msg.set_content('Message body is not available in headers-only mode.')
+            box.add(msg)
+        box.flush()
+    finally:
+        box.close()
+    return str(output_path)
+
+
+def redact_sensitive_text(text):
+    """Redact detected secret values while retaining the finding category."""
+    redacted = text
+    found = []
+    for pattern, label in SENSITIVE_PATTERNS:
+        if re.search(pattern, redacted):
+            found.append(label)
+            redacted = re.sub(pattern, f'[REDACTED:{label}]', redacted)
+    return redacted, found
+
+
+def redact_eml(source_path, destination_path):
+    """Write a redacted copy of an EML; the original is never modified."""
+    source_path, destination_path = Path(source_path), Path(destination_path)
+    msg = email.message_from_bytes(source_path.read_bytes(), policy=email.policy.default)
+    flags = set()
+    parts = msg.walk() if msg.is_multipart() else [msg]
+    for part in parts:
+        if part.get_content_type() not in ('text/plain', 'text/html'):
+            continue
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            continue
+        charset = part.get_content_charset() or 'utf-8'
+        body = payload.decode(charset, errors='replace')
+        body, body_flags = redact_sensitive_text(body)
+        flags.update(body_flags)
+        subtype = part.get_content_subtype()
+        part.set_content(body, subtype=subtype, charset=charset)
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    with destination_path.open('wb') as fh:
+        BytesGenerator(fh, policy=email.policy.SMTP).flatten(msg)
+    return sorted(flags)
+
+
+def _zip_directory(source_dir, zip_path):
+    source_dir = Path(source_dir)
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+        for path in source_dir.rglob('*'):
+            if path.is_file():
+                archive.write(path, path.relative_to(source_dir).as_posix())
+
+
+def encrypt_archive(source_dir, output_path, passphrase):
+    """Create an AES-256-GCM encrypted ZIP archive using a passphrase."""
+    if not passphrase:
+        raise ValueError('A non-empty passphrase is required')
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+    except ImportError as exc:
+        raise RuntimeError('Encrypted archives require the cryptography package') from exc
+    salt, nonce = secrets.token_bytes(16), secrets.token_bytes(12)
+    key = Scrypt(salt=salt, length=32, n=2**14, r=8, p=1).derive(passphrase.encode('utf-8'))
+    with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as temporary:
+        zip_path = Path(temporary.name)
+    try:
+        _zip_directory(source_dir, zip_path)
+        encrypted = AESGCM(key).encrypt(nonce, zip_path.read_bytes(), None)
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b'GMAILDOWNLOADER-AES256\n' + salt + nonce + encrypted)
+    finally:
+        try:
+            zip_path.unlink()
+        except OSError:
+            pass
+    return str(output_path)
+
+
+def decrypt_archive(archive_path, output_dir, passphrase):
+    """Decrypt an archive created by :func:`encrypt_archive` safely."""
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+    except ImportError as exc:
+        raise RuntimeError('Encrypted archives require the cryptography package') from exc
+    payload = Path(archive_path).read_bytes()
+    magic = b'GMAILDOWNLOADER-AES256\n'
+    if not payload.startswith(magic) or len(payload) <= len(magic) + 28:
+        raise ValueError('Not a GmailDownloader encrypted archive')
+    offset = len(magic)
+    salt, nonce, encrypted = payload[offset:offset + 16], payload[offset + 16:offset + 28], payload[offset + 28:]
+    key = Scrypt(salt=salt, length=32, n=2**14, r=8, p=1).derive(passphrase.encode('utf-8'))
+    raw_zip = AESGCM(key).decrypt(nonce, encrypted, None)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(raw_zip)) as archive:
+        root = output_dir.resolve()
+        for member in archive.infolist():
+            target = (output_dir / member.filename).resolve()
+            if root != target and root not in target.parents:
+                raise ValueError('Archive contains an unsafe path')
+        archive.extractall(output_dir)
+    return str(output_dir)
 
 
 # ─── IMAP Workers ─────────────────────────────────────────────────────────
@@ -877,33 +1394,57 @@ class ImapDownloadWorker(QThread):
     finished_signal = pyqtSignal(list)
     error = pyqtSignal(str)
 
-    def __init__(self, host, addr, pw, output_dir, skip=None):
+    def __init__(self, host, addr, pw, output_dir, skip=None, since=None,
+                 options=None, port=993, use_ssl=True, auth_mode='password',
+                 access_token=''):
         super().__init__()
         self.host, self.addr, self.pw = host, addr, pw
         self.output_dir = Path(output_dir)
         self.skip = skip or GMAIL_SKIP_FOLDERS
+        self.options = options or SyncOptions(since=parse_since_date(since))
+        self.port, self.use_ssl = port, use_ssl
+        self.auth_mode, self.access_token = auth_mode, access_token
         self._stop = False
 
     def stop(self): self._stop = True
 
     def run(self):
+        manifest = new_manifest()
+        manifest_path = self.output_dir / MANIFEST_FILENAME
+        imap = None
         try:
             folders_dir = self.output_dir / "folders"
             folders_dir.mkdir(parents=True, exist_ok=True)
-            manifest_path = self.output_dir / "manifest.json"
-            manifest = {'folders': {}, 'message_ids': {}}
-            if manifest_path.exists():
-                try:
-                    with open(manifest_path, 'r', encoding='utf-8') as f:
-                        manifest = json.load(f)
-                    if 'folders' not in manifest:
-                        manifest = {'folders': {}, 'message_ids': {}}
-                except: manifest = {'folders': {}, 'message_ids': {}}
+            try:
+                manifest = load_manifest(manifest_path)
+            except (OSError, ValueError, TypeError) as exc:
+                self.log.emit(f"Manifest could not be read; starting safely: {exc}")
+                manifest = new_manifest()
+
+            integrity_issues = validate_manifest(
+                manifest, self.output_dir, update_missing=True
+            ) if self.options.verify_integrity else []
+            invalid_paths = {issue.get('path') for issue in integrity_issues if issue.get('path')}
+            for issue in integrity_issues:
+                folder = issue.get('folder')
+                uid = issue.get('uid')
+                self.log.emit(f"[{folder}:{uid}] {issue.get('reason', 'integrity failure')}; re-fetching")
+                records = manifest.get('folders', {}).get(folder, {})
+                if isinstance(records, dict):
+                    records.pop(uid, None)
             seen_ids = manifest.get('message_ids', {})
+            for mid, local_path in list(seen_ids.items()):
+                if not local_path:
+                    continue
+                resolved = resolve_manifest_path(local_path, self.output_dir)
+                if str(resolved) in invalid_paths or not resolved.exists():
+                    seen_ids.pop(mid, None)
 
             self.status.emit("Connecting...")
-            imap = imaplib.IMAP4_SSL(self.host, 993)
-            imap.login(self.addr, self.pw)
+            imap = open_imap_connection(
+                self.host, self.port, self.use_ssl, self.addr, self.pw,
+                self.auth_mode, self.access_token
+            )
             _, folder_data = imap.list()
             all_folders = []
             for line in folder_data:
@@ -914,33 +1455,45 @@ class ImapDownloadWorker(QThread):
             self.log.emit(f"Downloading {len(active)} folders, skipping {len(self.skip)}")
 
             folder_uids = {}
+            folder_uidvalidity = {}
             total_count = 0
             for fn in active:
                 if self._stop: break
                 try:
                     if imap.select(f'"{fn}"', readonly=True)[0] != 'OK': continue
-                    _, d = imap.uid('SEARCH', None, 'ALL')
+                    current_validity = imap_uidvalidity(imap)
+                    folder_uidvalidity[fn] = current_validity
+                    metadata = manifest.setdefault('folder_metadata', {}).setdefault(fn, {})
+                    previous_validity = str(metadata.get('uidvalidity', ''))
+                    if previous_validity and current_validity and previous_validity != current_validity:
+                        self.log.emit(f"[{fn}] UIDVALIDITY changed; rebuilding folder index")
+                        manifest['folders'][fn] = {}
+                        metadata.clear()
+                    fm = manifest.setdefault('folders', {}).setdefault(fn, {})
+                    since_query = imap_since_query(self.options.since)
+                    if since_query:
+                        _, d = imap.uid('SEARCH', None, 'SINCE', since_query)
+                    else:
+                        _, d = imap.uid('SEARCH', None, 'ALL')
                     u = d[0].split() if d[0] else []
+                    last_uid = int(metadata.get('last_uid', 0) or 0)
+                    if self.options.incremental and last_uid and not since_query:
+                        u = [uid for uid in u if uid.isdigit() and int(uid) > last_uid]
                     folder_uids[fn] = u; total_count += len(u)
-                    self.log.emit(f"  {fn}: {len(u):,}")
+                    mode = "delta" if self.options.incremental else "full"
+                    if since_query:
+                        mode = f"since {since_query}"
+                    self.log.emit(f"  {fn}: {len(u):,} candidates ({mode})")
                 except Exception as e:
                     self.log.emit(f"  {fn}: error - {e}")
 
             all_emails = []
             gp = 0
             for fn, fm in manifest.get('folders', {}).items():
+                if not isinstance(fm, dict):
+                    continue
                 for uid_str, info in fm.items():
-                    em = EmailInfo(uid=f"{fn}:{uid_str}", sender=info.get('sender',''),
-                        sender_name=info.get('sender_name',''), subject=info.get('subject',''),
-                        date=info.get('date',''), date_parsed=parse_date(info.get('date','')),
-                        has_list_unsubscribe=info.get('has_list_unsubscribe',False),
-                        list_unsubscribe_url=info.get('list_unsubscribe_url',''),
-                        local_path=info.get('local_path',''), source_folder=fn,
-                        message_id=info.get('message_id',''),
-                        in_reply_to=info.get('in_reply_to',''),
-                        references=info.get('references',''),
-                        size_bytes=info.get('size_bytes',0))
-                    all_emails.append(em)
+                    all_emails.append(email_info_from_record(f"{fn}:{uid_str}", info, fn, self.addr))
 
             for fn, uids in folder_uids.items():
                 if self._stop: break
@@ -960,7 +1513,9 @@ class ImapDownloadWorker(QThread):
                     if self._stop: break
                     bu = remaining[i:i+50]
                     try: _, md = imap.uid('FETCH', b','.join(bu), '(RFC822)')
-                    except: gp += len(bu); continue
+                    except Exception as exc:
+                        self.log.emit(f"[{safe}] fetch failed: {exc}")
+                        continue
                     for item in md:
                         if self._stop: break
                         if not isinstance(item, tuple) or len(item) != 2: continue
@@ -969,71 +1524,100 @@ class ImapDownloadWorker(QThread):
                         uid = um.group(1).decode()
                         raw = item[1]
                         if not isinstance(raw, bytes): continue
+                        if self.options.max_message_size and len(raw) > self.options.max_message_size:
+                            self.log.emit(f"[{safe}:{uid}] skipped ({format_size(len(raw))} exceeds limit)")
+                            fm[uid] = {'size_bytes': len(raw), 'skipped': True, 'source_folder': fn}
+                            continue
                         try:
-                            msg = email.message_from_bytes(raw)
-                            mid = msg.get('Message-ID','')
-                            fd = decode_header(msg.get('From',''))
-                            nm, ad = email.utils.parseaddr(fd)
-                            unsub = msg.get('List-Unsubscribe','')
-                            irt = msg.get('In-Reply-To','')
-                            refs = msg.get('References','')
-                        except:
-                            mid=ad=nm=fd=unsub=irt=refs=''; raw=item[1]
-                        if mid and mid in seen_ids:
-                            eml_path = seen_ids[mid]
-                        else:
+                            em = parse_email_message(raw, f"{fn}:{uid}", fn, account=self.addr)
+                        except Exception as exc:
+                            self.log.emit(f"[{safe}:{uid}] header parse failed: {exc}")
+                            continue
+                        eml_path = ''
+                        if self.options.attachments_only:
+                            extract_attachments_to(raw, self.output_dir, date_value=em.date_parsed)
+                        elif em.message_id and em.message_id in seen_ids:
+                            candidate = resolve_manifest_path(seen_ids[em.message_id], self.output_dir)
+                            if candidate.exists():
+                                eml_path = str(candidate)
+                        if not self.options.attachments_only and not eml_path:
                             eml_path = str(fdir / f"{uid}.eml")
                             try:
-                                with open(eml_path, 'wb') as f: f.write(raw)
-                            except: continue
-                            if mid: seen_ids[mid] = eml_path
-                        em = EmailInfo(uid=f"{fn}:{uid}", sender=ad or fd,
-                            sender_name=nm or ad or fd,
-                            subject=decode_header(msg.get('Subject','') if 'msg' in dir() else ''),
-                            date=msg.get('Date','') if 'msg' in dir() else '',
-                            date_parsed=parse_date(msg.get('Date','') if 'msg' in dir() else ''),
-                            has_list_unsubscribe=bool(unsub), list_unsubscribe_url=unsub,
-                            local_path=eml_path, source_folder=fn, message_id=mid,
-                            in_reply_to=irt, references=refs,
-                            size_bytes=len(raw))
+                                Path(eml_path).write_bytes(raw)
+                            except OSError as exc:
+                                self.log.emit(f"[{safe}:{uid}] save failed: {exc}")
+                                continue
+                            if em.message_id:
+                                seen_ids[em.message_id] = eml_path
+                        em.local_path = eml_path
+                        em.size_bytes = len(raw)
                         all_emails.append(em)
                         self.email_saved.emit(em)
-                        if fn not in manifest['folders']: manifest['folders'][fn] = {}
-                        manifest['folders'][fn][uid] = {
-                            'sender': em.sender, 'sender_name': em.sender_name,
-                            'subject': em.subject, 'date': em.date,
-                            'has_list_unsubscribe': em.has_list_unsubscribe,
-                            'list_unsubscribe_url': em.list_unsubscribe_url,
-                            'local_path': eml_path, 'message_id': mid,
-                            'in_reply_to': irt, 'references': refs,
-                            'size_bytes': em.size_bytes}
+                        record = email_info_to_record(em)
+                        if eml_path:
+                            record['sha256'] = sha256_file(eml_path)
+                        fm[uid] = record
                     gp += len(bu)
                     self.progress.emit(gp, total_count)
                 manifest['message_ids'] = seen_ids
-                try:
-                    with open(manifest_path, 'w', encoding='utf-8') as f:
-                        json.dump(manifest, f, ensure_ascii=False)
-                except: pass
+                metadata = manifest.setdefault('folder_metadata', {}).setdefault(fn, {})
+                metadata['uidvalidity'] = folder_uidvalidity.get(fn, metadata.get('uidvalidity', ''))
+                if not self.options.since and not self._stop and uids:
+                    metadata['last_uid'] = max(int(uid) for uid in uids if uid.isdigit())
+                metadata['last_sync'] = datetime.now().isoformat(timespec='seconds')
+                save_manifest(manifest_path, manifest)
             try: imap.logout()
-            except: pass
+            except Exception: pass
+            manifest['message_ids'] = seen_ids
+            manifest['sync'] = {
+                'last_successful_at': datetime.now().isoformat(timespec='seconds'),
+                'incremental': self.options.incremental,
+                'since': self.options.since.isoformat() if self.options.since else '',
+                'attachments_only': self.options.attachments_only,
+            }
+            save_manifest(manifest_path, manifest)
             self.finished_signal.emit(all_emails)
         except Exception as e:
+            try:
+                manifest['message_ids'] = manifest.get('message_ids', {})
+                save_manifest(manifest_path, manifest)
+            except Exception:
+                pass
+            if imap is not None:
+                try: imap.logout()
+                except Exception: pass
             self.error.emit(f"Error: {e}\n{traceback.format_exc()}")
 
 
 class ImapLabelWorker(QThread):
     progress = pyqtSignal(int, int); status = pyqtSignal(str)
     log = pyqtSignal(str); finished_signal = pyqtSignal(); error = pyqtSignal(str)
-    def __init__(self, host, addr, pw, cats, prefix="", archive=False):
+    def __init__(self, host, addr, pw, cats, prefix="", archive=False, dry_run=True,
+                 port=993, use_ssl=True, auth_mode='password', access_token=''):
         super().__init__()
         self.host, self.addr, self.pw = host, addr, pw
         self.cats, self.prefix, self.archive = cats, prefix, archive
+        self.dry_run = dry_run
+        self.port, self.use_ssl = port, use_ssl
+        self.auth_mode, self.access_token = auth_mode, access_token
         self._stop = False
     def stop(self): self._stop = True
     def run(self):
         try:
-            imap = imaplib.IMAP4_SSL(self.host, 993); imap.login(self.addr, self.pw)
             total = sum(len(v) for v in self.cats.values()); done = 0
+            if self.dry_run:
+                self.status.emit("Preview only — no mailbox changes")
+                for cat, emails in self.cats.items():
+                    if self._stop: break
+                    label = f"{self.prefix}/{cat}" if self.prefix else cat
+                    self.log.emit(f"Would label {len(emails):,} messages as '{label}'")
+                    done += len(emails); self.progress.emit(done, total)
+                self.finished_signal.emit()
+                return
+            imap = open_imap_connection(
+                self.host, self.port, self.use_ssl, self.addr, self.pw,
+                self.auth_mode, self.access_token
+            )
             for cat, emails in self.cats.items():
                 if self._stop: break
                 if not emails: continue
@@ -1051,6 +1635,11 @@ class ImapLabelWorker(QThread):
                         b = uids[i:i+100]
                         try: imap.uid('COPY', ','.join(b), f'"{label}"')
                         except Exception as e: self.log.emit(f"Error: {e}")
+                        if self.archive and folder.upper() == 'INBOX':
+                            try:
+                                imap.uid('STORE', ','.join(b), '-FLAGS', '(\\Inbox)')
+                            except Exception as e:
+                                self.log.emit(f"Archive error: {e}")
                         done += len(b); self.progress.emit(done, total)
                 self.log.emit(f"Labeled {len(emails):,} as '{label}'")
             try: imap.logout()
@@ -1873,6 +2462,27 @@ class ConnectPage(QWidget):
         hint.setStyleSheet(f"color:{C.SUBTEXT0}; font-size:11px;"); hint.setWordWrap(True)
         fl.addWidget(hint); fl.addSpacing(12)
 
+        sync_group = QGroupBox("Sync options")
+        sync_form = QFormLayout(sync_group)
+        self.incremental_check = QCheckBox("Resume incrementally (new UIDs only)")
+        self.incremental_check.setChecked(True)
+        sync_form.addRow(self.incremental_check)
+        since_row = QHBoxLayout()
+        self.since_check = QCheckBox("Only messages since")
+        self.since_date_edit = QDateEdit(QDate.currentDate().addYears(-1))
+        self.since_date_edit.setCalendarPopup(True)
+        self.since_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.since_date_edit.setEnabled(False)
+        self.since_check.toggled.connect(self.since_date_edit.setEnabled)
+        since_row.addWidget(self.since_check); since_row.addWidget(self.since_date_edit)
+        sync_form.addRow(since_row)
+        self.verify_check = QCheckBox("Verify downloaded files before re-use")
+        self.verify_check.setChecked(True)
+        sync_form.addRow(self.verify_check)
+        self.attachments_only_check = QCheckBox("Attachments only (do not retain .eml bodies)")
+        sync_form.addRow(self.attachments_only_check)
+        fl.addWidget(sync_group)
+
         r1 = QHBoxLayout()
         self.dl_btn = QPushButton("Download Full Mailbox")
         self.dl_btn.setStyleSheet(f"background-color:{C.GREEN};")
@@ -1895,6 +2505,15 @@ class ConnectPage(QWidget):
         self.load_local_btn.clicked.connect(self._on_load_local); r2.addWidget(self.load_local_btn)
         fl.addLayout(r2)
 
+        r3 = QHBoxLayout()
+        self.load_mbox_btn = QPushButton("Import mbox")
+        self.load_mbox_btn.setProperty("secondary", True)
+        self.load_mbox_btn.clicked.connect(self._on_load_mbox); r3.addWidget(self.load_mbox_btn)
+        self.load_tb_btn = QPushButton("Import Thunderbird")
+        self.load_tb_btn.setProperty("secondary", True)
+        self.load_tb_btn.clicked.connect(self._on_load_thunderbird); r3.addWidget(self.load_tb_btn)
+        fl.addLayout(r3)
+
         self.status_label = QLabel("")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status_label.setStyleSheet(f"color:{C.SUBTEXT0}; font-size:12px;")
@@ -1902,7 +2521,8 @@ class ConnectPage(QWidget):
         layout.addWidget(form, alignment=Qt.AlignmentFlag.AlignCenter); layout.addStretch()
 
     def _set_btns(self, en):
-        for b in (self.scan_btn, self.dl_btn, self.load_scan_btn, self.load_local_btn): b.setEnabled(en)
+        for b in (self.scan_btn, self.dl_btn, self.load_scan_btn, self.load_local_btn,
+                  self.load_mbox_btn, self.load_tb_btn): b.setEnabled(en)
 
     def _on_action(self, mode):
         self.email_addr = self.email_input.text().strip()
@@ -1920,6 +2540,18 @@ class ConnectPage(QWidget):
         self._tt = QThread(); self._tw = ConnectionTester(self.imap_host, self.email_addr, self.password)
         self._tw.moveToThread(self._tt); self._tt.started.connect(self._tw.run)
         self._tw.success.connect(self._ok); self._tw.error.connect(self._fail); self._tt.start()
+
+    def sync_options(self):
+        since = None
+        if self.since_check.isChecked():
+            qdate = self.since_date_edit.date()
+            since = datetime(qdate.year(), qdate.month(), qdate.day())
+        return SyncOptions(
+            since=since,
+            incremental=self.incremental_check.isChecked(),
+            verify_integrity=self.verify_check.isChecked(),
+            attachments_only=self.attachments_only_check.isChecked(),
+        )
 
     def _ok(self, c):
         self._tt.quit(); self.status_label.setText(f"Connected! {c:,} in Inbox")
@@ -1981,6 +2613,51 @@ class ConnectPage(QWidget):
         except Exception as e:
             self.status_label.setText(str(e)); self.status_label.setStyleSheet(f"color:{C.RED};")
 
+    def _load_imported(self, emails, output_dir):
+        if not emails:
+            self.status_label.setText("No messages found")
+            self.status_label.setStyleSheet(f"color:{C.RED};")
+            return
+        address = self.email_input.text().strip()
+        domain = address.split('@', 1)[1] if '@' in address else ""
+        engine = CategoryEngine(domain)
+        engine.process_all(emails)
+        self.download_dir = str(output_dir) if output_dir else ""
+        self.loaded_engine = engine
+        self.status_label.setText(f"Imported {len(emails):,} messages")
+        self.status_label.setStyleSheet(f"color:{C.GREEN};")
+        self.connected.emit("load")
+
+    def _on_load_mbox(self):
+        source, _ = QFileDialog.getOpenFileName(self, "Import mbox", "", "Mailbox files (*)")
+        if not source:
+            return
+        output_dir = QFileDialog.getExistingDirectory(self, "Archive output folder")
+        if not output_dir:
+            return
+        self.status_label.setText("Importing mbox...")
+        QApplication.processEvents()
+        try:
+            self._load_imported(import_mbox(source, output_dir), output_dir)
+        except Exception as exc:
+            self.status_label.setText(f"Import failed: {exc}")
+            self.status_label.setStyleSheet(f"color:{C.RED};")
+
+    def _on_load_thunderbird(self):
+        profile = QFileDialog.getExistingDirectory(self, "Select Thunderbird profile")
+        if not profile:
+            return
+        output_dir = QFileDialog.getExistingDirectory(self, "Archive output folder")
+        if not output_dir:
+            return
+        self.status_label.setText("Importing Thunderbird profile...")
+        QApplication.processEvents()
+        try:
+            self._load_imported(import_thunderbird_profile(profile, output_dir), output_dir)
+        except Exception as exc:
+            self.status_label.setText(f"Import failed: {exc}")
+            self.status_label.setStyleSheet(f"color:{C.RED};")
+
 
 # ─── UI: Download Page ───────────────────────────────────────────────────
 
@@ -2012,10 +2689,10 @@ class DownloadPage(QWidget):
         self.cont_btn.clicked.connect(self.download_complete.emit); bot.addWidget(self.cont_btn)
         layout.addLayout(bot)
 
-    def start_download(self, host, addr, pw, out_dir):
+    def start_download(self, host, addr, pw, out_dir, options=None):
         ud = addr.split('@')[1] if '@' in addr else ""
         self.engine = CategoryEngine(ud); self._out = out_dir; self._n = 0
-        self.worker = ImapDownloadWorker(host, addr, pw, out_dir)
+        self.worker = ImapDownloadWorker(host, addr, pw, out_dir, options=options)
         self.worker.progress.connect(lambda c,t: (self.progress.setMaximum(t), self.progress.setValue(c),
             self.pct.setText(f"{int(c/t*100) if t else 0}% ({c:,}/{t:,})")))
         self.worker.status.connect(self.status_label.setText)
@@ -2170,7 +2847,9 @@ class ReviewPage(QWidget):
         export_menu = QMenu(self)
         export_menu.addAction("CSV", self._export_csv)
         export_menu.addAction("JSON", self._export_json)
+        export_menu.addAction("MBOX", self._export_mbox)
         export_menu.addAction("HTML Archive", self._export_html)
+        export_menu.addAction("Encrypted Archive", self._export_encrypted)
         self.export_btn.setMenu(export_menu); tb2.addWidget(self.export_btn)
 
         tb2.addWidget(QLabel("|")); tb2.addWidget(QLabel(""))  # spacer
@@ -2178,6 +2857,8 @@ class ReviewPage(QWidget):
         self.attach_btn.clicked.connect(self._extract_attachments); tb2.addWidget(self.attach_btn)
         self.sensitive_btn = QPushButton("Sensitive"); self.sensitive_btn.setProperty("secondary", True)
         self.sensitive_btn.clicked.connect(self._scan_sensitive); tb2.addWidget(self.sensitive_btn)
+        self.redact_btn = QPushButton("Redact Copies"); self.redact_btn.setProperty("secondary", True)
+        self.redact_btn.clicked.connect(self._redact_sensitive); tb2.addWidget(self.redact_btn)
         self.ai_btn = QPushButton("AI Classify"); self.ai_btn.setProperty("secondary", True)
         self.ai_btn.clicked.connect(self._ai_classify); tb2.addWidget(self.ai_btn)
         self.thread_btn = QPushButton("Threads"); self.thread_btn.setProperty("secondary", True)
@@ -2289,6 +2970,8 @@ class ReviewPage(QWidget):
         go.addWidget(QLabel("Prefix:")); self.prefix_input = QLineEdit(); self.prefix_input.setMaximumWidth(150)
         go.addWidget(self.prefix_input)
         self.archive_chk = QCheckBox("Archive from Inbox"); go.addWidget(self.archive_chk)
+        self.dry_run_chk = QCheckBox("Preview only (no mailbox changes)")
+        self.dry_run_chk.setChecked(True); go.addWidget(self.dry_run_chk)
         opts.addWidget(self.gmail_opts)
         self.local_opts = QWidget(); lo = QHBoxLayout(self.local_opts); lo.setContentsMargins(0,0,0,0)
         self.copy_radio = QRadioButton("Copy"); self.copy_radio.setChecked(True)
@@ -2302,12 +2985,16 @@ class ReviewPage(QWidget):
         bot.addLayout(opts); layout.addLayout(bot)
 
         self.mode_gmail.toggled.connect(self._mode_changed); self.mode_local.toggled.connect(self._mode_changed)
+        self.dry_run_chk.toggled.connect(self._mode_changed)
         self._mode_changed()
 
     def _mode_changed(self):
         g = self.mode_gmail.isChecked()
         self.gmail_opts.setVisible(g); self.local_opts.setVisible(not g)
-        self.exec_btn.setText("Apply Gmail Labels" if g else "Organize Local Files")
+        self.exec_btn.setText(
+            "Preview Gmail Labels" if g and self.dry_run_chk.isChecked()
+            else "Apply Gmail Labels" if g else "Organize Local Files"
+        )
         self.exec_btn.setStyleSheet(f"background-color:{C.BLUE if g else C.GREEN};font-size:14px;padding:10px 30px;")
 
     def load_categories(self, eng, has_local=False, dl_dir=""):
@@ -2322,6 +3009,7 @@ class ReviewPage(QWidget):
             self.mode_local.setEnabled(False)
         self.attach_btn.setEnabled(has_local)
         self.sensitive_btn.setEnabled(has_local)
+        self.redact_btn.setEnabled(has_local)
         self.thread_btn.setEnabled(has_local and HAS_ANTHROPIC)
 
     def _refresh_tree(self, *_):
@@ -2557,6 +3245,32 @@ class ReviewPage(QWidget):
             self.engine.export_json(p)
             QMessageBox.information(self, "Exported", f"Exported {len(self.engine.emails):,} emails to JSON")
 
+    def _export_mbox(self):
+        if not self.engine: return
+        p, _ = QFileDialog.getSaveFileName(self, "Export MBOX", "gmaildownloader.mbox", "MBOX (*.mbox);;All files (*)")
+        if p:
+            try:
+                export_mbox(self.engine.emails, p)
+                QMessageBox.information(self, "Exported", f"Exported {len(self.engine.emails):,} emails to MBOX")
+            except Exception as exc:
+                QMessageBox.warning(self, "Export failed", str(exc))
+
+    def _export_encrypted(self):
+        if not self.engine or not self._dl_dir:
+            QMessageBox.warning(self, "Unavailable", "Encrypted archive export requires a downloaded mailbox.")
+            return
+        p, _ = QFileDialog.getSaveFileName(self, "Encrypted archive", "gmaildownloader.gd", "Encrypted archive (*.gd)")
+        if not p:
+            return
+        password, ok = QInputDialog.getText(self, "Archive passphrase", "Passphrase:", QLineEdit.EchoMode.Password)
+        if not ok or not password:
+            return
+        try:
+            encrypt_archive(self._dl_dir, p, password)
+            QMessageBox.information(self, "Encrypted", f"Encrypted archive written to:\n{p}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Encryption failed", str(exc))
+
     def _export_html(self):
         if not self.engine or not self._dl_dir: return
         self.export_btn.setEnabled(False)
@@ -2608,6 +3322,31 @@ class ReviewPage(QWidget):
             self._refresh_tree()
         QMessageBox.information(self, "Sensitive Scan",
             f"Found {count} emails with sensitive content (SSN, CC#, passwords, API keys)")
+
+    def _redact_sensitive(self):
+        if not self.engine or not self._dl_dir:
+            return
+        destination = QFileDialog.getExistingDirectory(
+            self, "Redacted copies folder", str(Path(self._dl_dir) / "redacted")
+        )
+        if not destination:
+            return
+        written = 0
+        for em in self.engine.emails:
+            if not em.local_path or not Path(em.local_path).exists():
+                continue
+            target_dir = Path(destination) / sanitize_filename(em.category or "Uncategorized", 60)
+            target = target_dir / f"{sanitize_filename(em.uid.replace(':', '_'), 80)}.eml"
+            try:
+                flags = redact_eml(em.local_path, target)
+                if flags:
+                    em.sensitive_flags = sorted(set(em.sensitive_flags).union(flags))
+                    written += 1
+            except Exception:
+                continue
+        QMessageBox.information(
+            self, "Redacted copies", f"Wrote {written:,} redacted EML copies to:\n{destination}"
+        )
 
     def _ai_classify(self):
         if not HAS_ANTHROPIC:
@@ -2703,9 +3442,9 @@ class ExecutePage(QWidget):
         self.done_lbl = QLabel(""); bot.addWidget(self.done_lbl)
         layout.addLayout(bot)
 
-    def start_gmail(self, host, addr, pw, cats, prefix, archive):
-        self.title_lbl.setText("Applying Gmail Labels")
-        self.worker = ImapLabelWorker(host, addr, pw, cats, prefix, archive)
+    def start_gmail(self, host, addr, pw, cats, prefix, archive, dry_run=True):
+        self.title_lbl.setText("Previewing Gmail Labels" if dry_run else "Applying Gmail Labels")
+        self.worker = ImapLabelWorker(host, addr, pw, cats, prefix, archive, dry_run=dry_run)
         self._wire()
 
     def start_local(self, cats, out_dir, copy):
@@ -2774,7 +3513,10 @@ class MainWindow(QMainWindow):
             self.ap.set_preloaded(self.cp.loaded_engine); self.stack.setCurrentWidget(self.ap)
         elif mode == "download":
             self._dl_dir = self.cp.download_dir; self.stack.setCurrentWidget(self.dp)
-            self.dp.start_download(self.cp.imap_host, self.cp.email_addr, self.cp.password, self._dl_dir)
+            self.dp.start_download(
+                self.cp.imap_host, self.cp.email_addr, self.cp.password, self._dl_dir,
+                self.cp.sync_options()
+            )
         else:
             self.stack.setCurrentWidget(self.ap)
             self.ap.start_scan(self.cp.imap_host, self.cp.email_addr, self.cp.password)
@@ -2801,9 +3543,19 @@ class MainWindow(QMainWindow):
         else:
             if not self.cp.email_addr or not self.cp.password:
                 QMessageBox.warning(self, "Credentials", "Enter Gmail credentials."); return
+            dry_run = self.rp.dry_run_chk.isChecked()
+            if not dry_run:
+                answer = QMessageBox.question(
+                    self, "Confirm mailbox changes",
+                    "This will create Gmail labels and may archive messages from Inbox. Continue?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
             self.stack.setCurrentWidget(self.ep)
             self.ep.start_gmail(self.cp.imap_host, self.cp.email_addr, self.cp.password,
-                cats, self.rp.prefix_input.text().strip(), self.rp.archive_chk.isChecked())
+                cats, self.rp.prefix_input.text().strip(), self.rp.archive_chk.isChecked(), dry_run)
 
 
 def main():
