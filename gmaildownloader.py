@@ -1436,9 +1436,9 @@ def _merge_receipt_pages(results, source='', uid='', sender='', category=''):
         return normalize_receipt_result({}, source, uid, sender, category)
     merged = normalized[0].copy()
     for item in normalized[1:]:
-        for field in ('merchant', 'date', 'amount', 'currency'):
-            if not merged.get(field) and item.get(field):
-                merged[field] = item[field]
+        for field_name in ('merchant', 'date', 'amount', 'currency'):
+            if not merged.get(field_name) and item.get(field_name):
+                merged[field_name] = item[field_name]
         merged['line_items'].extend(item.get('line_items', []))
     merged['pages'] = len(normalized)
     return merged
@@ -2294,48 +2294,6 @@ class OllamaClassifier:
         response = self.complete(prompt, [base64.b64encode(path.read_bytes()).decode('ascii')])
         result = _json_object(response)
         return result if result else {'raw': response, 'media_type': media_type}
-
-
-def classify_receipt_image_anthropic(image_path, api_key, model='claude-3-5-sonnet-20241022'):
-    """Use Anthropic vision for one image attachment when an API key is supplied."""
-    if not api_key:
-        raise ValueError('An Anthropic API key is required')
-    if not HAS_ANTHROPIC:
-        raise RuntimeError('The anthropic package is not installed')
-    path = Path(image_path)
-    media_type = mimetypes.guess_type(path.name)[0] or 'image/jpeg'
-    if media_type not in ('image/jpeg', 'image/png', 'image/gif', 'image/webp'):
-        raise ValueError(f'Unsupported receipt image type: {media_type}')
-    client = anthropic.Anthropic(api_key=api_key)
-    response = client.messages.create(
-        model=model,
-        max_tokens=600,
-        messages=[{'role': 'user', 'content': [
-            {'type': 'image', 'source': {'type': 'base64', 'media_type': media_type,
-                                         'data': base64.b64encode(path.read_bytes()).decode('ascii')}},
-            {'type': 'text', 'text': 'Extract merchant, date, total amount, currency, and line items as JSON. Return only JSON.'},
-        ]}],
-    )
-    text_response = response.content[0].text
-    match = re.search(r'\{.*\}', text_response, re.DOTALL)
-    return json.loads(match.group()) if match else {'raw': text_response}
-
-
-def extract_receipts(emails):
-    receipts = []
-    for em in emails:
-        body = ''
-        if em.local_path and Path(em.local_path).exists():
-            try:
-                msg = email.message_from_bytes(Path(em.local_path).read_bytes(), policy=email.policy.default)
-                body = extract_message_body(msg, 50000)
-            except OSError:
-                pass
-        fields = extract_receipt_fields(f'{em.subject}\n{body}')
-        if fields['amount'] is not None or fields['merchant']:
-            fields.update({'uid': em.uid, 'sender': em.sender, 'category': em.category})
-            receipts.append(fields)
-    return receipts
 
 
 def load_archive_emails(output_dir, verify_integrity=True):

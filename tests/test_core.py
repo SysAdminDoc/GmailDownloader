@@ -326,6 +326,8 @@ def test_receipt_vision_renders_pdf_and_exports_ofx():
         extracted = app.extract_receipt_attachments([email_info], classifier)
         assert extracted[0]["attachment"] == "invoice.pdf"
         assert extracted[0]["uid"] == "1"
+        combined = app.extract_receipts([email_info], vision_classifier=classifier)
+        assert any(item.get("attachment") == "invoice.pdf" for item in combined)
 
 
 def test_headless_import_and_scheduler_helpers(capsys):
