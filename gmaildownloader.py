@@ -4,6 +4,7 @@
 VERSION = "1.1.0"
 
 import sys, os, subprocess
+from pathlib import Path
 
 
 # codex-branding:start
@@ -57,11 +58,9 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import Optional
-from pathlib import Path
-
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import *
-from PyQt6.QtGui import *, QIcon
+from PyQt6.QtGui import *
 
 try:
     import anthropic
