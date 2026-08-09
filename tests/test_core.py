@@ -24,6 +24,7 @@ def test_manifest_hashes_detect_tampering():
         loaded = app.load_manifest(manifest_path)
         assert app.validate_manifest(loaded, root, update_missing=True) == []
         assert loaded["folders"]["INBOX"]["1"]["sha256"]
+        assert loaded["app_version"] == app.VERSION
 
         message.write_bytes(b"tampered")
         issues = app.validate_manifest(loaded, root)

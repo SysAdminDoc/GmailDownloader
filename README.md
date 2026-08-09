@@ -1,6 +1,6 @@
 # GmailDownloader
 
-![Version](https://img.shields.io/badge/version-v1.1.0-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Platform](https://img.shields.io/badge/platform-Python-lightgrey)
+![Version](https://img.shields.io/badge/version-v1.2.0-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Platform](https://img.shields.io/badge/platform-Python-lightgrey)
 
 Full Gmail mailbox downloader, AI-powered organizer, and analytics suite. Download your entire Gmail as `.eml` files, auto-categorize with 150+ domain mappings and Claude AI, then organize locally — without ever modifying your live mailbox.
 
@@ -17,6 +17,7 @@ Full Gmail mailbox downloader, AI-powered organizer, and analytics suite. Downlo
 ### Analytics
 - **Statistics Dashboard** — Emails per month, activity heatmap (day x hour), top senders/domains, category distribution, storage breakdown
 - **Group-by Views** — Instantly regroup the tree view by Category, Sender Domain, Sender, or Source Folder
+- **Location Timeline** — Extract public IP hops from `Received:` headers for a local travel-history audit
 
 ### Subscription Management
 - **Subscription Scanner** — Detects newsletters via `List-Unsubscribe` header + 25+ newsletter platform domains (Mailchimp, SendGrid, Substack, etc.)
@@ -28,6 +29,7 @@ Full Gmail mailbox downloader, AI-powered organizer, and analytics suite. Downlo
 - **Gmail Filter Import** — Parse Gmail's filter export XML into GmailDownloader rules
 - **Attachment Extraction** — Pulls all attachments from `.eml` files, deduplicates by SHA-256, organizes by category
 - **Sensitive Content Scanner** — Detects SSNs, credit card numbers, passwords, API keys, and tokens in email bodies
+- **Receipt Vision + OFX** — Render PDF/image receipts, optionally OCR and classify with Anthropic/Ollama, then export normalized transactions
 - **Thread Summarization** — Reconstructs email threads via `In-Reply-To`/`References` headers, generates 2-3 sentence AI summaries
 - **CSV/JSON Export** — Full metadata export (date, sender, subject, category, confidence, folder, size, newsletter flag, sensitive flags)
 

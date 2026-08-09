@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""GmailDownloader v1.1.0 — Full Gmail Mailbox Downloader, AI Organizer & Analytics Suite"""
+"""GmailDownloader v1.2.0 — Full Gmail Mailbox Downloader, AI Organizer & Analytics Suite"""
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 MANIFEST_VERSION = 2
 MANIFEST_FILENAME = "manifest.json"
 
@@ -1622,6 +1622,7 @@ def new_manifest():
     """Return the current manifest shape used by resumable downloads."""
     return {
         'version': MANIFEST_VERSION,
+        'app_version': VERSION,
         'folders': {},
         'message_ids': {},
         'folder_metadata': {},
@@ -1636,6 +1637,7 @@ def normalize_manifest(manifest):
     normalized = new_manifest()
     normalized.update(manifest)
     normalized['version'] = max(int(manifest.get('version', 1) or 1), MANIFEST_VERSION)
+    normalized['app_version'] = VERSION
     normalized['folders'] = manifest.get('folders', {}) if isinstance(manifest.get('folders', {}), dict) else {}
     normalized['message_ids'] = manifest.get('message_ids', {}) if isinstance(manifest.get('message_ids', {}), dict) else {}
     normalized['folder_metadata'] = manifest.get('folder_metadata', {}) if isinstance(manifest.get('folder_metadata', {}), dict) else {}

@@ -2,7 +2,7 @@
 
 All notable changes to GmailDownloader will be documented in this file.
 
-## [Unreleased]
+## [v1.2.0]
 
 - Added OAuth2/XOAUTH2, Gmail REST, Microsoft Graph, generic IMAP, mbox, and Thunderbird source paths.
 - Added resumable SHA-256 manifests, delta sync, attachments-only and encrypted archive workflows.
