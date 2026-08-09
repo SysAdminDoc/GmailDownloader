@@ -8,6 +8,7 @@ All notable changes to GmailDownloader will be documented in this file.
 - Added resumable SHA-256 manifests, delta sync, attachments-only and encrypted archive workflows.
 - Added headless sync/import/export tooling, Markdown/PDF/MBOX/graph exports, local Ollama classification, and analytics forecasts.
 - Added PDF/image receipt vision, optional OCR, normalized receipt JSON, OFX export, and Received-header location timelines.
+- Added reproducible Windows, macOS, and Linux packaging scripts with optional Authenticode signing.
 
 ## [v1.1.0]
 

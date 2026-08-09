@@ -1363,15 +1363,36 @@ def extract_receipt_fields(text):
 
 
 def render_pdf_pages(pdf_path, output_dir, max_pages=3, scale=2.0):
-    """Render up to ``max_pages`` of a PDF into PNGs using optional PDFium."""
+    """Render up to ``max_pages`` of a PDF into PNGs using PDFium or ImageMagick."""
     try:
-        import pypdfium2 as pdfium
-    except ImportError as exc:
-        raise RuntimeError('PDF receipt vision requires pypdfium2 (pip install pypdfium2)') from exc
+        # Keep PDFium optional and out of the base PyInstaller dependency graph.
+        pdfium = __import__('pypdf' + 'ium2')
+    except (ImportError, OSError):
+        pdfium = None
     pdf_path, output_dir = Path(pdf_path), Path(output_dir)
     if not pdf_path.exists():
         raise FileNotFoundError(pdf_path)
     output_dir.mkdir(parents=True, exist_ok=True)
+    if pdfium is None:
+        magick = shutil.which('magick')
+        if not magick and os.name != 'nt':
+            magick = shutil.which('convert')
+        if not magick:
+            raise RuntimeError(
+                'PDF receipt vision requires pypdfium2 or ImageMagick (install pypdfium2 for PDFium support)'
+            )
+        density = max(36, int(72 * float(scale)))
+        pattern = output_dir / f'{pdf_path.stem}_page-%d.png'
+        try:
+            subprocess.run(
+                [magick, '-density', str(density), f'{pdf_path}[0-{max(0, int(max_pages) - 1)}]',
+                 '-alpha', 'remove', '-colorspace', 'sRGB', str(pattern)],
+                check=True, capture_output=True, text=True, timeout=120,
+            )
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            detail = getattr(exc, 'stderr', '') or str(exc)
+            raise RuntimeError(f'ImageMagick could not render {pdf_path}: {detail}') from exc
+        return sorted(output_dir.glob(f'{pdf_path.stem}_page-*.png'))[:max(1, int(max_pages))]
     document = pdfium.PdfDocument(str(pdf_path))
     images = []
     try:

@@ -1,4 +1,7 @@
 __pycache__/
+.build-check/
+build/
+dist/
 CLAUDE.md
 
 # Markdown files local-only (except README)

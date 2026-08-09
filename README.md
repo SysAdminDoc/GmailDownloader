@@ -45,6 +45,26 @@ python gmaildownloader.py
 
 Dependencies (`PyQt6`, `anthropic`) are auto-installed on first run.
 
+For scheduled or containerized backups, use headless mode:
+
+```bash
+python gmaildownloader.py --headless --sync --output-dir ./archive
+python gmaildownloader.py --headless --load-dir ./archive --export-receipts-ofx receipts.ofx
+```
+
+PDF receipt vision uses optional `pypdfium2` and `Pillow`; OCR additionally uses
+`pytesseract` plus a local Tesseract installation. The packaged Windows build
+falls back to ImageMagick when PDFium is not bundled.
+
+### Distribution
+
+- Windows: `.\build.ps1` builds `dist/GmailDownloader.exe`. Supply
+  `-Sign` and `GMAILDOWNLOADER_SIGNING_CERT` for a certificate-backed
+  Authenticode release.
+- macOS: `./build-macos.sh` builds `dist/GmailDownloader.app` on macOS.
+- Linux: `./build-linux-appimage.sh` builds an AppImage when `appimagetool`
+  is installed.
+
 ### Workflow
 
 1. **Connect** — Enter Gmail address + App Password

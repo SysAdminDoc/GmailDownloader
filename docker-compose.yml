@@ -1,0 +1,12 @@
+services:
+  gmaildownloader:
+    build: .
+    environment:
+      GMAIL_ADDRESS: ${GMAIL_ADDRESS}
+      GMAIL_APP_PASSWORD: ${GMAIL_APP_PASSWORD:-}
+      GMAIL_ACCESS_TOKEN: ${GMAIL_ACCESS_TOKEN:-}
+      GMAIL_IMAP_HOST: ${GMAIL_IMAP_HOST:-imap.gmail.com}
+      GMAIL_OUTPUT_DIR: /archive
+    volumes:
+      - ./archive:/archive
+    command: ["--sync", "--output-dir", "/archive"]
