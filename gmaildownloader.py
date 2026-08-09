@@ -6,6 +6,7 @@ MANIFEST_VERSION = 2
 MANIFEST_FILENAME = "manifest.json"
 
 import base64
+import argparse
 import calendar
 import csv
 import email
@@ -17,13 +18,16 @@ from email.message import EmailMessage
 import hashlib
 import html
 import imaplib
+import ipaddress
 import io
 import json
 import mailbox
 import mimetypes
+import multiprocessing
 import os
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
@@ -692,6 +696,33 @@ class CategoryEngine:
             'category_counts': {k: len(v) for k, v in sorted(self.categories.items(), key=lambda x: -len(x[1]))},
         }
 
+    def search(self, query, limit=0):
+        return search_emails(self.emails, query, limit)
+
+    def confidence_candidates(self, threshold=0.75):
+        return [em for em in self.emails if em.confidence < threshold]
+
+    def relationship_graph(self):
+        return build_relationship_graph(self.emails, self.threads)
+
+    def thread_clusters(self, similarity_threshold=0.25):
+        return cluster_threads(self.threads, similarity_threshold)
+
+    def sender_health(self):
+        return sender_health_scores(self.emails)
+
+    def reply_latency(self):
+        return reply_latency_histogram(self.emails, self.threads)
+
+    def storage_forecast(self, months=12):
+        return storage_forecast(self.emails, months)
+
+    def location_timeline(self, resolver=None, include_private=False):
+        return build_location_timeline(self.emails, resolver, include_private)
+
+    def inbox_zero_suggestions(self, older_than_days=180):
+        return suggest_inbox_zero(self.emails, older_than_days)
+
     def rename_category(self, old: str, new: str):
         if old in self.categories:
             emails = self.categories.pop(old)
@@ -754,6 +785,30 @@ class CategoryEngine:
                 for em in self.emails]
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def export_mbox(self, path):
+        return export_mbox(self.emails, path)
+
+    def export_markdown(self, path, include_body=True):
+        return export_markdown_vault(self.emails, path, include_body)
+
+    def export_notion(self, path, include_body=True):
+        return export_notion_markdown(self.emails, path, include_body)
+
+    def export_pdf(self, path):
+        return export_pdf(self.emails, path)
+
+    def export_relationship_graph(self, path):
+        return export_relationship_graph(self.relationship_graph(), path)
+
+    def export_contact_graph(self, path):
+        return export_contact_graph(self.emails, path)
+
+    def export_receipts_ofx(self, path, receipts=None):
+        return export_receipts_ofx(receipts if receipts is not None else extract_receipts(self.emails), path)
+
+    def export_location_timeline(self, path):
+        return export_location_timeline_csv(self.location_timeline(), path)
 
     def save_state(self, path: str):
         data = {'version': VERSION, 'user_domain': self.user_domain,
@@ -832,6 +887,714 @@ def format_size(b):
     if b < 1024**2: return f"{b/1024:.1f} KB"
     if b < 1024**3: return f"{b/1024**2:.1f} MB"
     return f"{b/1024**3:.1f} GB"
+
+
+SEARCH_FILTERS = {'from', 'subject', 'category', 'domain', 'folder', 'after', 'before', 'has'}
+
+
+def parse_search_query(query):
+    filters, terms = {}, []
+    for token in shlex.split(query or ''):
+        if ':' in token:
+            key, value = token.split(':', 1)
+            if key.lower() in SEARCH_FILTERS and value:
+                filters[key.lower()] = value
+                continue
+        terms.append(token.lower())
+    return filters, terms
+
+
+def search_emails(emails, query, limit=0):
+    """Search metadata and available local bodies with Gmail-like filters."""
+    filters, terms = parse_search_query(query)
+    after = parse_since_date(filters['after']) if filters.get('after') else None
+    before = parse_since_date(filters['before']) if filters.get('before') else None
+    results = []
+    for em in emails:
+        if filters.get('from', '').lower() not in (em.sender + ' ' + em.sender_name).lower():
+            if 'from' in filters:
+                continue
+        if filters.get('subject', '').lower() not in em.subject.lower() and 'subject' in filters:
+            continue
+        if filters.get('category', '').lower() not in em.category.lower() and 'category' in filters:
+            continue
+        if filters.get('domain', '').lower() not in em.sender_domain.lower() and 'domain' in filters:
+            continue
+        if filters.get('folder', '').lower() not in em.source_folder.lower() and 'folder' in filters:
+            continue
+        if after and (not em.date_parsed or em.date_parsed < after):
+            continue
+        if before and (not em.date_parsed or em.date_parsed >= before):
+            continue
+        has_filter = filters.get('has', '').lower()
+        if has_filter == 'attachment' and not em.has_attachments:
+            continue
+        if has_filter in ('newsletter', 'unsubscribe') and not em.is_newsletter and not em.has_list_unsubscribe:
+            continue
+        if has_filter == 'sensitive' and not em.sensitive_flags:
+            continue
+        if terms:
+            body = ''
+            if em.local_path and Path(em.local_path).exists():
+                try:
+                    msg = email.message_from_bytes(Path(em.local_path).read_bytes(), policy=email.policy.default)
+                    body = extract_message_body(msg, 10000)
+                except OSError:
+                    pass
+            haystack = ' '.join((em.sender, em.sender_name, em.subject, em.category,
+                                 em.source_folder, body)).lower()
+            if not all(term in haystack for term in terms):
+                continue
+        results.append(em)
+        if limit and len(results) >= limit:
+            break
+    return results
+
+
+def build_relationship_graph(emails, threads=None):
+    """Build a weighted sender co-occurrence graph from reconstructed threads."""
+    thread_map = threads or {}
+    if not thread_map:
+        thread_map = defaultdict(list)
+        for em in emails:
+            thread_map[em.message_id or em.uid].append(em)
+    edge_weights = Counter()
+    nodes = Counter()
+    for members in thread_map.values():
+        senders = sorted({em.sender or em.sender_domain for em in members if em.sender or em.sender_domain})
+        for sender in senders:
+            nodes[sender] += 1
+        for index, left in enumerate(senders):
+            for right in senders[index + 1:]:
+                edge_weights[(left, right)] += 1
+    return {
+        'nodes': [{'id': sender, 'threads': count} for sender, count in nodes.most_common()],
+        'edges': [{'source': left, 'target': right, 'weight': weight}
+                  for (left, right), weight in edge_weights.most_common()],
+    }
+
+
+def cluster_threads(threads, similarity_threshold=0.25):
+    """Cluster threads with a deterministic token similarity fallback."""
+    def tokens(members):
+        text = ' '.join(f'{em.subject} {em.sender_domain}' for em in members).lower()
+        return {token for token in re.findall(r'[a-z0-9]{3,}', text)}
+
+    clusters = []
+    for thread_id, members in threads.items():
+        current = tokens(members)
+        placed = False
+        for cluster in clusters:
+            overlap = current & cluster['tokens']
+            union = current | cluster['tokens']
+            if union and len(overlap) / len(union) >= similarity_threshold:
+                cluster['thread_ids'].append(thread_id)
+                cluster['tokens'].update(current)
+                placed = True
+                break
+        if not placed:
+            clusters.append({'thread_ids': [thread_id], 'tokens': set(current)})
+    return [
+        {'cluster_id': index + 1, 'thread_ids': item['thread_ids']}
+        for index, item in enumerate(clusters)
+    ]
+
+
+def export_relationship_graph(graph, output_path):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.suffix.lower() == '.graphml':
+        lines = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<graphml xmlns="http://graphml.graphdrawing.org/xmlns">',
+            '<graph edgedefault="undirected"><node id="__dummy__"/>',
+        ]
+        lines.pop()  # keep the declaration compact while avoiding a mutable template
+        lines.append('<graph edgedefault="undirected">')
+        for node in graph.get('nodes', []):
+            node_id = html.escape(str(node['id']), quote=True)
+            lines.append(f'<node id="{node_id}"/>')
+        for index, edge in enumerate(graph.get('edges', [])):
+            lines.append(f'<edge id="e{index}" source="{html.escape(str(edge["source"]), quote=True)}" '
+                         f'target="{html.escape(str(edge["target"]), quote=True)}"/>')
+        lines.extend(['</graph>', '</graphml>'])
+        output_path.write_text('\n'.join(lines), encoding='utf-8')
+    else:
+        output_path.write_text(json.dumps(graph, indent=2, ensure_ascii=False), encoding='utf-8')
+    return str(output_path)
+
+
+def contact_graph(emails):
+    graph = build_relationship_graph(emails)
+    return graph
+
+
+def export_contact_graph(emails, output_path):
+    return export_relationship_graph(contact_graph(emails), output_path)
+
+
+def export_markdown_vault(emails, output_dir, include_body=True):
+    """Export one Markdown note per message with Obsidian-friendly frontmatter."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for index, em in enumerate(sorted(emails, key=lambda item: item.date_parsed or datetime.min, reverse=True)):
+        date_value = em.date_parsed.strftime('%Y-%m-%dT%H:%M:%S') if em.date_parsed else ''
+        title = em.subject or 'No subject'
+        stem = sanitize_filename(f'{date_value[:10]}_{em.sender_domain}_{title}', 150)
+        target = output_dir / f'{stem}_{index}.md'
+        body = ''
+        if include_body and em.local_path and Path(em.local_path).exists():
+            try:
+                msg = email.message_from_bytes(Path(em.local_path).read_bytes(), policy=email.policy.default)
+                body = extract_message_body(msg)
+            except OSError:
+                body = ''
+        frontmatter = {
+            'subject': title,
+            'from': em.sender,
+            'date': date_value,
+            'category': em.category,
+            'source_folder': em.source_folder,
+            'message_id': em.message_id,
+            'newsletter': em.is_newsletter,
+            'sensitive': em.sensitive_flags,
+        }
+        lines = ['---'] + [f'{key}: {json.dumps(value, ensure_ascii=False)}' for key, value in frontmatter.items()] + ['---', '', f'# {title}', '']
+        if body:
+            lines.extend([body, ''])
+        else:
+            lines.append('_Body unavailable in headers-only mode._')
+        target.write_text('\n'.join(lines), encoding='utf-8')
+        written.append(str(target))
+    return written
+
+
+def export_notion_markdown(emails, output_dir, include_body=True):
+    """Export Notion-importable Markdown using the same portable vault format."""
+    return export_markdown_vault(emails, output_dir, include_body)
+
+
+def export_pdf(emails, output_path):
+    """Render email metadata and readable bodies to a portable PDF."""
+    try:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.lib.units import inch
+        from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
+    except ImportError as exc:
+        raise RuntimeError('PDF export requires reportlab') from exc
+    styles = getSampleStyleSheet()
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    story = []
+    for index, em in enumerate(emails):
+        story.append(Paragraph(html.escape(em.subject or '(no subject)'), styles['Title']))
+        story.append(Paragraph(
+            html.escape(f'From: {em.sender} | Date: {em.date} | Category: {em.category}'),
+            styles['Normal']))
+        story.append(Spacer(1, 0.2 * inch))
+        body = ''
+        if em.local_path and Path(em.local_path).exists():
+            msg = email.message_from_bytes(Path(em.local_path).read_bytes(), policy=email.policy.default)
+            body = extract_message_body(msg, 50000)
+        story.append(Paragraph(html.escape(body or 'Body unavailable in headers-only mode.').replace('\n', '<br/>'), styles['BodyText']))
+        if index < len(emails) - 1:
+            story.append(PageBreak())
+    SimpleDocTemplate(str(output_path), pagesize=letter).build(story)
+    return str(output_path)
+
+
+def sender_health_scores(emails, now=None):
+    """Score senders using volume, recency, replies, and unsubscribe signals."""
+    now = now or datetime.now()
+    grouped = defaultdict(list)
+    for em in emails:
+        grouped[em.sender or em.sender_name or 'unknown'].append(em)
+    scores = []
+    for sender, messages in grouped.items():
+        last = max((em.date_parsed for em in messages if em.date_parsed), default=None)
+        age_days = (now - last).days if last else 9999
+        recency = max(0.0, 1.0 - age_days / 365)
+        replies = sum(bool(em.in_reply_to or em.references) for em in messages)
+        reply_rate = replies / len(messages)
+        newsletters = sum(em.is_newsletter or em.has_list_unsubscribe for em in messages)
+        unsubscribe_rate = newsletters / len(messages)
+        score = round(100 * (0.5 * recency + 0.35 * reply_rate + 0.15 * (1 - unsubscribe_rate)), 1)
+        scores.append({'sender': sender, 'score': score, 'count': len(messages),
+                       'reply_rate': round(reply_rate, 3), 'last_seen': last.isoformat() if last else ''})
+    return sorted(scores, key=lambda item: (-item['score'], -item['count'], item['sender']))
+
+
+def reply_latency_histogram(emails, threads=None):
+    histogram = Counter()
+    thread_map = threads or {}
+    if not thread_map:
+        thread_map = defaultdict(list)
+        for em in emails:
+            thread_map[em.message_id or em.uid].append(em)
+    for members in thread_map.values():
+        ordered = sorted(members, key=lambda em: em.date_parsed or datetime.min)
+        for previous, current in zip(ordered, ordered[1:]):
+            if previous.date_parsed and current.date_parsed:
+                hours = (current.date_parsed - previous.date_parsed).total_seconds() / 3600
+                if hours < 1: bucket = '<1h'
+                elif hours < 4: bucket = '1-4h'
+                elif hours < 24: bucket = '4-24h'
+                elif hours < 72: bucket = '1-3d'
+                else: bucket = '3d+'
+                histogram[bucket] += 1
+    return dict(histogram)
+
+
+def storage_forecast(emails, months=12):
+    monthly = Counter()
+    for em in emails:
+        if em.date_parsed:
+            monthly[em.date_parsed.strftime('%Y-%m')] += em.size_bytes
+    ordered = sorted(monthly.items())
+    recent = [size for _, size in ordered[-6:]]
+    average = sum(recent) / len(recent) if recent else 0
+    current = sum(monthly.values())
+    forecast = []
+    for offset in range(1, months + 1):
+        forecast.append({'months_from_now': offset, 'projected_bytes': int(current + average * offset)})
+    return {'monthly_bytes': dict(ordered), 'average_monthly_bytes': int(average), 'forecast': forecast}
+
+
+def location_timeline(emails, resolver=None):
+    """Extract public IP hops from ``Received`` headers for an audit timeline.
+
+    A resolver is deliberately injected instead of calling a geolocation API from
+    the application.  It may return a country string or a mapping containing
+    country/city/latitude/longitude fields.  Private and reserved addresses are
+    omitted by default because they do not describe a useful travel location.
+    """
+    return build_location_timeline(emails, resolver=resolver)
+
+
+def _received_ip_addresses(header):
+    """Yield validated IPv4/IPv6 literals from one Received header."""
+    candidates = re.findall(
+        r'\[[0-9A-Fa-f:.]+\]|(?<![A-Za-z0-9_:])(?:\d{1,3}\.){3}\d{1,3}|'
+        r'(?<![A-Za-z0-9_:])(?:[0-9A-Fa-f]{1,4}:){2,}[0-9A-Fa-f:.]+',
+        str(header),
+    )
+    seen = set()
+    for candidate in candidates:
+        candidate = candidate.strip('[]')
+        try:
+            address = ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        normalized = str(address)
+        if normalized not in seen:
+            seen.add(normalized)
+            yield address
+
+
+def _received_timestamp(header):
+    """Parse the timestamp after the final semicolon in a Received header."""
+    text = str(header)
+    if ';' not in text:
+        return None
+    try:
+        return email.utils.parsedate_to_datetime(text.rsplit(';', 1)[1].strip())
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+
+
+def build_location_timeline(emails, resolver=None, include_private=False):
+    timeline = []
+    for em in emails:
+        if not em.local_path or not Path(em.local_path).exists():
+            continue
+        try:
+            msg = email.message_from_bytes(Path(em.local_path).read_bytes(), policy=email.policy.default)
+        except (OSError, ValueError):
+            continue
+        for hop, received in enumerate(msg.get_all('Received', []), start=1):
+            timestamp = _received_timestamp(received)
+            for address in _received_ip_addresses(received):
+                if not include_private and not address.is_global:
+                    continue
+                item = {
+                    'date': em.date,
+                    'received_at': timestamp.isoformat() if timestamp else '',
+                    'ip': str(address),
+                    'version': address.version,
+                    'country': '',
+                    'uid': em.uid,
+                    'hop': hop,
+                }
+                if resolver:
+                    try:
+                        resolved = resolver(str(address))
+                        if isinstance(resolved, dict):
+                            item.update({str(key): value for key, value in resolved.items()})
+                            item['country'] = str(resolved.get('country', item.get('country', '')) or '')
+                        elif resolved:
+                            item['country'] = str(resolved)
+                    except Exception:
+                        # A missing/failed resolver must not make local analysis fail.
+                        pass
+                timeline.append(item)
+    return sorted(timeline, key=lambda item: (item.get('received_at') or item.get('date', ''), item['uid'], item['hop']))
+
+
+def export_location_timeline_csv(timeline, output_path):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fields = ['received_at', 'date', 'ip', 'version', 'country', 'uid', 'hop']
+    with output_path.open('w', newline='', encoding='utf-8') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows({field: item.get(field, '') for field in fields} for item in timeline)
+    return str(output_path)
+
+
+def suggest_inbox_zero(emails, older_than_days=180, now=None):
+    now = now or datetime.now()
+    suggestions = []
+    for em in emails:
+        age = (now - em.date_parsed).days if em.date_parsed else 0
+        if em.is_newsletter or em.has_list_unsubscribe:
+            suggestions.append({'uid': em.uid, 'action': 'unsubscribe_or_archive', 'reason': 'newsletter'})
+        elif age >= older_than_days and em.confidence > 0:
+            suggestions.append({'uid': em.uid, 'action': 'archive', 'reason': f'older than {older_than_days} days'})
+    return suggestions
+
+
+RECEIPT_ATTACHMENT_EXTENSIONS = {'.pdf', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.tif', '.tiff', '.bmp'}
+RECEIPT_IMAGE_TYPES = {'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/tiff', 'image/bmp'}
+RECEIPT_VISION_PROMPT = (
+    'Extract this receipt or invoice as JSON with exactly these useful fields: '
+    'merchant, date (YYYY-MM-DD when possible), amount (number), currency (ISO 4217), '
+    'and line_items (array of {description, quantity, amount}). Return only JSON.'
+)
+
+
+def _json_object(value):
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return {}
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r'\{', value):
+        try:
+            parsed, _ = decoder.raw_decode(value[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def _receipt_amount(value):
+    if value is None or value == '':
+        return None
+    if isinstance(value, (int, float)):
+        return round(float(value), 2)
+    match = re.search(r'-?\d[\d,]*(?:\.\d+)?', str(value))
+    return round(float(match.group().replace(',', '')), 2) if match else None
+
+
+def _receipt_date(value):
+    if not value:
+        return ''
+    text = str(value).strip()
+    formats = ('%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%m-%d-%Y', '%B %d, %Y', '%b %d, %Y')
+    for fmt in formats:
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            continue
+    match = re.search(r'\b(20\d{2})[-/]([01]?\d)[-/]([0-3]?\d)\b', text)
+    return '-'.join(match.groups()) if match else text
+
+
+def normalize_receipt_result(value, source='', uid='', sender='', category=''):
+    """Normalize text/vision output into a stable, exportable receipt schema."""
+    data = _json_object(value)
+    raw_items = data.get('line_items', data.get('items', []))
+    if not isinstance(raw_items, list):
+        raw_items = []
+    line_items = []
+    for item in raw_items:
+        if isinstance(item, dict):
+            line_items.append({
+                'description': str(item.get('description', item.get('name', '')) or '').strip(),
+                'quantity': item.get('quantity', 1),
+                'amount': _receipt_amount(item.get('amount', item.get('total'))),
+            })
+        elif item:
+            line_items.append({'description': str(item).strip(), 'quantity': 1, 'amount': None})
+    result = {
+        'merchant': str(data.get('merchant', data.get('store', data.get('vendor', ''))) or '').strip(),
+        'date': _receipt_date(data.get('date', data.get('transaction_date', ''))),
+        'amount': _receipt_amount(data.get('amount', data.get('total', data.get('grand_total')))),
+        'currency': str(data.get('currency', '') or '').upper().strip(),
+        'line_items': line_items,
+        'source': str(source or ''),
+        'uid': str(uid or ''),
+        'sender': str(sender or ''),
+        'category': str(category or ''),
+    }
+    if data.get('raw') and not result['merchant']:
+        result['raw'] = str(data['raw'])
+    return result
+
+
+def extract_receipt_fields(text):
+    amount = re.search(
+        r'(?i)(?:total|amount|charged|grand total)\s*(?::|=)?\s*'
+        r'(?P<currency>[$€£]|USD|EUR|GBP)?\s*([0-9,]+(?:\.\d{2})?)', text
+    )
+    date_match = re.search(r'\b(20\d{2}[-/]\d{1,2}[-/]\d{1,2})\b', text)
+    merchant = re.search(r'(?i)(?:merchant|store|from)\s*[:\-]\s*([^\n]{2,80})', text)
+    currency = amount.group('currency') if amount else ''
+    currency = {'$': 'USD', '€': 'EUR', '£': 'GBP'}.get(currency, currency or '')
+    return normalize_receipt_result({
+        'amount': amount.group(2).replace(',', '') if amount else None,
+        'currency': currency,
+        'date': date_match.group(1) if date_match else '',
+        'merchant': merchant.group(1).strip() if merchant else '',
+    })
+
+
+def render_pdf_pages(pdf_path, output_dir, max_pages=3, scale=2.0):
+    """Render up to ``max_pages`` of a PDF into PNGs using optional PDFium."""
+    try:
+        import pypdfium2 as pdfium
+    except ImportError as exc:
+        raise RuntimeError('PDF receipt vision requires pypdfium2 (pip install pypdfium2)') from exc
+    pdf_path, output_dir = Path(pdf_path), Path(output_dir)
+    if not pdf_path.exists():
+        raise FileNotFoundError(pdf_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    document = pdfium.PdfDocument(str(pdf_path))
+    images = []
+    try:
+        for index in range(min(len(document), max(1, int(max_pages)))):
+            page = document[index]
+            bitmap = page.render(scale=max(0.5, float(scale)))
+            image = bitmap.to_pil().convert('RGB')
+            destination = output_dir / f'{pdf_path.stem}_page_{index + 1}.png'
+            image.save(destination, format='PNG')
+            images.append(destination)
+            page.close()
+            bitmap.close()
+    finally:
+        document.close()
+    return images
+
+
+def ocr_receipt_image(image_path, ocr_engine=None):
+    """Run injected OCR or optional Tesseract without making it a hard dependency."""
+    if ocr_engine:
+        return str(ocr_engine(Path(image_path)) or '')
+    try:
+        import pytesseract
+        return str(pytesseract.image_to_string(str(image_path)) or '')
+    except ImportError as exc:
+        raise RuntimeError('OCR requires pytesseract and a Tesseract installation') from exc
+    except Exception as exc:
+        raise RuntimeError(f'OCR failed for {image_path}: {exc}') from exc
+
+
+def _receipt_image_paths(attachment_path, temporary_dir, max_pages=3):
+    attachment_path = Path(attachment_path)
+    if attachment_path.suffix.lower() == '.pdf':
+        return render_pdf_pages(attachment_path, temporary_dir, max_pages=max_pages)
+    return [attachment_path]
+
+
+def _merge_receipt_pages(results, source='', uid='', sender='', category=''):
+    normalized = [normalize_receipt_result(item, source, uid, sender, category) for item in results]
+    if not normalized:
+        return normalize_receipt_result({}, source, uid, sender, category)
+    merged = normalized[0].copy()
+    for item in normalized[1:]:
+        for field in ('merchant', 'date', 'amount', 'currency'):
+            if not merged.get(field) and item.get(field):
+                merged[field] = item[field]
+        merged['line_items'].extend(item.get('line_items', []))
+    merged['pages'] = len(normalized)
+    return merged
+
+
+class ReceiptVisionClassifier:
+    """PDF/image receipt classifier with Anthropic or local Ollama backends."""
+
+    def __init__(self, backend='anthropic', api_key='', model='claude-3-5-sonnet-20241022',
+                 endpoint='http://127.0.0.1:11434', max_pages=3, ocr=False, ocr_engine=None,
+                 image_classifier=None):
+        self.backend = backend
+        self.api_key = api_key
+        self.model = model
+        self.endpoint = endpoint
+        self.max_pages = max_pages
+        self.ocr = ocr
+        self.ocr_engine = ocr_engine
+        self.image_classifier = image_classifier
+
+    def _classify_image(self, image_path, ocr_text=''):
+        if self.image_classifier:
+            try:
+                return self.image_classifier(Path(image_path), ocr_text)
+            except TypeError:
+                return self.image_classifier(Path(image_path))
+        if self.backend == 'anthropic':
+            return classify_receipt_image_anthropic(image_path, self.api_key, self.model, ocr_text)
+        if self.backend == 'ollama':
+            return OllamaClassifier(self.model, self.endpoint).classify_receipt_image(image_path, ocr_text)
+        raise ValueError(f'Unsupported receipt vision backend: {self.backend}')
+
+    def classify_attachment(self, attachment_path, uid='', sender='', category=''):
+        attachment_path = Path(attachment_path)
+        with tempfile.TemporaryDirectory(prefix='gmaildownloader-receipt-') as temporary:
+            pages = _receipt_image_paths(attachment_path, temporary, self.max_pages)
+            results = []
+            for page in pages:
+                ocr_text = ocr_receipt_image(page, self.ocr_engine) if self.ocr else ''
+                results.append(self._classify_image(page, ocr_text))
+        return _merge_receipt_pages(results, attachment_path.name, uid, sender, category)
+
+
+def classify_receipt_image_anthropic(image_path, api_key, model='claude-3-5-sonnet-20241022', ocr_text=''):
+    """Use Anthropic vision for one rendered receipt page."""
+    if not api_key:
+        raise ValueError('An Anthropic API key is required')
+    if not HAS_ANTHROPIC:
+        raise RuntimeError('The anthropic package is not installed')
+    path = Path(image_path)
+    media_type = mimetypes.guess_type(path.name)[0] or 'image/jpeg'
+    if media_type not in RECEIPT_IMAGE_TYPES:
+        raise ValueError(f'Unsupported receipt image type: {media_type}')
+    prompt = RECEIPT_VISION_PROMPT
+    if ocr_text:
+        prompt += f'\nSupplemental OCR text (verify against the image):\n{ocr_text[:12000]}'
+    client = anthropic.Anthropic(api_key=api_key)
+    response = client.messages.create(
+        model=model,
+        max_tokens=800,
+        messages=[{'role': 'user', 'content': [
+            {'type': 'image', 'source': {'type': 'base64', 'media_type': media_type,
+                                         'data': base64.b64encode(path.read_bytes()).decode('ascii')}},
+            {'type': 'text', 'text': prompt},
+        ]}],
+    )
+    return _json_object(response.content[0].text)
+
+
+def extract_receipt_attachments(emails, classifier=None, ocr_engine=None):
+    """Classify image/PDF attachments or OCR them when a classifier is absent."""
+    receipts = []
+    for em in emails:
+        if not em.local_path or not Path(em.local_path).exists():
+            continue
+        try:
+            msg = email.message_from_bytes(Path(em.local_path).read_bytes(), policy=email.policy.default)
+        except (OSError, ValueError):
+            continue
+        for filename, payload, media_type in extract_attachments(msg):
+            suffix = Path(filename).suffix.lower()
+            if suffix not in RECEIPT_ATTACHMENT_EXTENSIONS and media_type not in RECEIPT_IMAGE_TYPES:
+                continue
+            temporary_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=suffix or '.bin', delete=False) as temporary:
+                    temporary.write(payload)
+                    temporary_path = Path(temporary.name)
+                if classifier:
+                    fields = classifier.classify_attachment(
+                        temporary_path, uid=em.uid, sender=em.sender, category=em.category
+                    )
+                else:
+                    with tempfile.TemporaryDirectory(prefix='gmaildownloader-ocr-') as temporary_dir:
+                        pages = _receipt_image_paths(temporary_path, temporary_dir)
+                        text = '\n'.join(ocr_receipt_image(page, ocr_engine) for page in pages)
+                    fields = extract_receipt_fields(f'{filename}\n{text}')
+                fields = normalize_receipt_result(fields, filename, em.uid, em.sender, em.category)
+                fields['attachment'] = filename
+                if fields['amount'] is not None or fields['merchant'] or fields['line_items']:
+                    receipts.append(fields)
+            except RuntimeError:
+                raise
+            except (OSError, ValueError):
+                continue
+            finally:
+                if temporary_path:
+                    try:
+                        temporary_path.unlink()
+                    except OSError:
+                        pass
+    return receipts
+
+
+def extract_receipts(emails, vision_classifier=None, ocr_engine=None):
+    receipts = []
+    for em in emails:
+        body = ''
+        if em.local_path and Path(em.local_path).exists():
+            try:
+                msg = email.message_from_bytes(Path(em.local_path).read_bytes(), policy=email.policy.default)
+                body = extract_message_body(msg, 50000)
+            except (OSError, ValueError):
+                pass
+        fields = extract_receipt_fields(f'{em.subject}\n{body}')
+        if fields['amount'] is not None or fields['merchant']:
+            fields.update({'uid': em.uid, 'sender': em.sender, 'category': em.category})
+            receipts.append(fields)
+    if vision_classifier or ocr_engine:
+        receipts.extend(extract_receipt_attachments(emails, vision_classifier, ocr_engine))
+    return receipts
+
+
+def export_receipts_ofx(receipts, output_path, account_id='GmailDownloader', currency='USD'):
+    """Export normalized receipt debits as an OFX 2-compatible statement."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    transactions = [receipt for receipt in receipts if _receipt_amount(receipt.get('amount')) is not None]
+    currencies = [str(receipt.get('currency', '')).upper() for receipt in transactions if receipt.get('currency')]
+    currency = currencies[0] if currencies else currency.upper()
+    now = datetime.now().strftime('%Y%m%d%H%M%S')
+    root = ET.Element('OFX')
+    signon = ET.SubElement(root, 'SIGNONMSGSRSV1')
+    sonrs = ET.SubElement(signon, 'SONRS')
+    status = ET.SubElement(sonrs, 'STATUS')
+    ET.SubElement(status, 'CODE').text = '0'
+    ET.SubElement(status, 'SEVERITY').text = 'INFO'
+    ET.SubElement(sonrs, 'DTSERVER').text = now
+    ET.SubElement(sonrs, 'LANGUAGE').text = 'ENG'
+    fi = ET.SubElement(sonrs, 'FI')
+    ET.SubElement(fi, 'ORG').text = 'GMAILDOWNLOADER'
+    ET.SubElement(fi, 'FID').text = 'GMAILDOWNLOADER'
+    bank = ET.SubElement(root, 'BANKMSGSRSV1')
+    response = ET.SubElement(bank, 'STMTTRNRS')
+    ET.SubElement(response, 'TRNUID').text = 'GMAILDOWNLOADER'
+    statement = ET.SubElement(response, 'STMTRS')
+    ET.SubElement(statement, 'CURDEF').text = currency
+    account = ET.SubElement(statement, 'BANKACCTFROM')
+    ET.SubElement(account, 'BANKID').text = 'GMAILDOWNLOADER'
+    ET.SubElement(account, 'ACCTID').text = account_id
+    transactions_node = ET.SubElement(statement, 'BANKTRANLIST')
+    dates = [receipt.get('date') for receipt in transactions if receipt.get('date')]
+    ET.SubElement(transactions_node, 'DTSTART').text = min(dates).replace('-', '') if dates else now[:8]
+    ET.SubElement(transactions_node, 'DTEND').text = max(dates).replace('-', '') if dates else now[:8]
+    for receipt in transactions:
+        transaction = ET.SubElement(transactions_node, 'STMTTRN')
+        ET.SubElement(transaction, 'TRNTYPE').text = 'DEBIT'
+        ET.SubElement(transaction, 'DTPOSTED').text = (receipt.get('date') or now[:8]).replace('-', '')[:8]
+        amount = _receipt_amount(receipt.get('amount'))
+        ET.SubElement(transaction, 'TRNAMT').text = f'{-abs(amount):.2f}'
+        identity = f"{receipt.get('uid', '')}|{receipt.get('attachment', '')}|{receipt.get('merchant', '')}"
+        ET.SubElement(transaction, 'FITID').text = hashlib.sha256(identity.encode('utf-8')).hexdigest()[:32]
+        ET.SubElement(transaction, 'NAME').text = receipt.get('merchant') or receipt.get('sender') or 'Receipt'
+        ET.SubElement(transaction, 'MEMO').text = receipt.get('subject') or receipt.get('attachment', '')
+    ET.indent(root, space='  ')
+    ET.ElementTree(root).write(output_path, encoding='utf-8', xml_declaration=True)
+    return str(output_path)
 
 
 def new_manifest():
@@ -1195,6 +1958,408 @@ def imap_uidvalidity(imap):
     return ''
 
 
+class OAuthTokenStore:
+    """Small JSON token store that never writes a client secret to disk."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def load(self):
+        try:
+            data = json.loads(self.path.read_text(encoding='utf-8'))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def save(self, token):
+        if not isinstance(token, dict) or not token.get('access_token'):
+            raise ValueError('An access token is required')
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(self.path.suffix + '.tmp')
+        temporary.write_text(json.dumps(token, indent=2), encoding='utf-8')
+        try:
+            os.chmod(temporary, 0o600)
+        except OSError:
+            pass
+        os.replace(temporary, self.path)
+
+
+class GoogleOAuthClient:
+    """Minimal Google OAuth authorization-code client using the stdlib only."""
+
+    AUTHORIZE_URL = 'https://accounts.google.com/o/oauth2/v2/auth'
+    TOKEN_URL = 'https://oauth2.googleapis.com/token'
+    GMAIL_SCOPE = 'https://mail.google.com/'
+
+    def __init__(self, client_id, client_secret='', redirect_uri='urn:ietf:wg:oauth:2.0:oob',
+                 opener=None):
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.redirect_uri = redirect_uri
+        self.opener = opener or urllib.request.urlopen
+
+    def authorization_url(self, state=None, scopes=None):
+        state = state or secrets.token_urlsafe(24)
+        query = urllib.parse.urlencode({
+            'client_id': self.client_id,
+            'redirect_uri': self.redirect_uri,
+            'response_type': 'code',
+            'scope': ' '.join(scopes or [self.GMAIL_SCOPE]),
+            'access_type': 'offline',
+            'prompt': 'consent',
+            'state': state,
+        })
+        return f'{self.AUTHORIZE_URL}?{query}', state
+
+    def _post_token(self, values):
+        request = urllib.request.Request(
+            self.TOKEN_URL,
+            data=urllib.parse.urlencode(values).encode('utf-8'),
+            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            method='POST',
+        )
+        try:
+            with self.opener(request, timeout=30) as response:
+                payload = json.loads(response.read().decode('utf-8'))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode('utf-8', errors='replace')
+            raise RuntimeError(f'Google OAuth failed ({exc.code}): {detail}') from exc
+        if 'error' in payload:
+            raise RuntimeError(payload.get('error_description', payload['error']))
+        return payload
+
+    def exchange_code(self, code):
+        values = {
+            'code': code,
+            'client_id': self.client_id,
+            'redirect_uri': self.redirect_uri,
+            'grant_type': 'authorization_code',
+        }
+        if self.client_secret:
+            values['client_secret'] = self.client_secret
+        return self._post_token(values)
+
+    def refresh(self, refresh_token):
+        values = {
+            'refresh_token': refresh_token,
+            'client_id': self.client_id,
+            'grant_type': 'refresh_token',
+        }
+        if self.client_secret:
+            values['client_secret'] = self.client_secret
+        return self._post_token(values)
+
+
+class GmailApiSource:
+    """Gmail REST source with label-aware pagination and raw MIME retrieval."""
+
+    BASE_URL = 'https://gmail.googleapis.com/gmail/v1/users'
+
+    def __init__(self, access_token, user_id='me', opener=None, timeout=60):
+        if not access_token:
+            raise ValueError('A Gmail API access token is required')
+        self.access_token = access_token
+        self.user_id = user_id
+        self.opener = opener or urllib.request.urlopen
+        self.timeout = timeout
+
+    def _request(self, path, params=None):
+        url = f'{self.BASE_URL}/{self.user_id}/{path.lstrip("/")}'
+        if params:
+            url = f'{url}?{urllib.parse.urlencode(params, doseq=True)}'
+        request = urllib.request.Request(
+            url, headers={'Authorization': f'Bearer {self.access_token}', 'Accept': 'application/json'}
+        )
+        try:
+            with self.opener(request, timeout=self.timeout) as response:
+                return json.loads(response.read().decode('utf-8'))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode('utf-8', errors='replace')
+            raise RuntimeError(f'Gmail API request failed ({exc.code}): {detail}') from exc
+
+    def list_labels(self):
+        payload = self._request('labels')
+        return payload.get('labels', [])
+
+    def iter_message_refs(self, query='', label_ids=None, page_size=100):
+        token = None
+        while True:
+            params = {'maxResults': min(max(page_size, 1), 500)}
+            if query:
+                params['q'] = query
+            if label_ids:
+                params['labelIds'] = label_ids
+            if token:
+                params['pageToken'] = token
+            payload = self._request('messages', params)
+            yield from payload.get('messages', [])
+            token = payload.get('nextPageToken')
+            if not token:
+                break
+
+    def fetch_message(self, message_id):
+        payload = self._request(f'messages/{urllib.parse.quote(str(message_id), safe="")}', {'format': 'raw'})
+        raw = payload.get('raw', '')
+        if not raw:
+            raise RuntimeError(f'Gmail API returned no raw MIME for {message_id}')
+        return base64.urlsafe_b64decode(raw + '=' * (-len(raw) % 4))
+
+    def iter_messages(self, query='', label_ids=None, page_size=100):
+        for reference in self.iter_message_refs(query, label_ids, page_size):
+            message_id = reference.get('id')
+            if message_id:
+                yield message_id, self.fetch_message(message_id), reference.get('labelIds', [])
+
+
+class GraphMailSource:
+    """Microsoft Graph adapter returning RFC822 MIME for the common mail path."""
+
+    BASE_URL = 'https://graph.microsoft.com/v1.0/me'
+
+    def __init__(self, access_token, opener=None, timeout=60):
+        if not access_token:
+            raise ValueError('A Microsoft Graph access token is required')
+        self.access_token = access_token
+        self.opener = opener or urllib.request.urlopen
+        self.timeout = timeout
+
+    def _request(self, url, accept='application/json'):
+        request = urllib.request.Request(
+            url, headers={'Authorization': f'Bearer {self.access_token}', 'Accept': accept}
+        )
+        try:
+            with self.opener(request, timeout=self.timeout) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode('utf-8', errors='replace')
+            raise RuntimeError(f'Microsoft Graph request failed ({exc.code}): {detail}') from exc
+
+    def iter_message_refs(self, folder='inbox', query='', page_size=100):
+        url = f'{self.BASE_URL}/mailFolders/{urllib.parse.quote(folder, safe="")}/messages'
+        params = {'$top': min(max(page_size, 1), 999), '$select': 'id,subject,receivedDateTime'}
+        if query:
+            params['$search'] = f'"{query}"'
+        url = f'{url}?{urllib.parse.urlencode(params)}'
+        while url:
+            payload = json.loads(self._request(url).decode('utf-8'))
+            yield from payload.get('value', [])
+            url = payload.get('@odata.nextLink', '')
+
+    def fetch_message(self, message_id):
+        url = f'{self.BASE_URL}/messages/{urllib.parse.quote(str(message_id), safe="")}/$value'
+        return self._request(url, accept='message/rfc822')
+
+    def iter_messages(self, folder='inbox', query='', page_size=100):
+        for reference in self.iter_message_refs(folder, query, page_size):
+            message_id = reference.get('id')
+            if message_id:
+                yield message_id, self.fetch_message(message_id), [folder]
+
+
+class MultiAccountManager:
+    """Resolve isolated output trees for several accounts without sharing manifests."""
+
+    def __init__(self, root_dir):
+        self.root_dir = Path(root_dir)
+        self.accounts = {}
+
+    def add(self, account):
+        if not account.name or not account.address:
+            raise ValueError('Account name and address are required')
+        self.accounts[account.name] = account
+
+    def remove(self, name):
+        self.accounts.pop(name, None)
+
+    def output_dir(self, account_or_name):
+        account = self.accounts.get(account_or_name, account_or_name)
+        account_name = account.name if isinstance(account, AccountConfig) else str(account)
+        return self.root_dir / sanitize_filename(account_name, 80)
+
+    def manifest_paths(self):
+        return {name: self.output_dir(name) / MANIFEST_FILENAME for name in self.accounts}
+
+    def sync_workers(self, options=None):
+        """Create isolated workers; callers can start them sequentially or concurrently."""
+        workers = []
+        for account in self.accounts.values():
+            destination = Path(account.output_dir) if account.output_dir else self.output_dir(account)
+            workers.append(ImapDownloadWorker(
+                account.host, account.address, account.secret, destination,
+                options=options or SyncOptions(), port=account.port, use_ssl=account.use_ssl,
+                auth_mode=account.auth_mode,
+                access_token=account.secret if account.auth_mode in ('oauth2', 'xoauth2', 'token') else '',
+            ))
+        return workers
+
+    def load_engines(self, verify_integrity=True):
+        engines = {}
+        for name, account in self.accounts.items():
+            destination = Path(account.output_dir) if account.output_dir else self.output_dir(name)
+            emails, _ = load_archive_emails(destination, verify_integrity)
+            domain = account.address.split('@', 1)[1] if '@' in account.address else ''
+            engine = CategoryEngine(domain)
+            engine.process_all(emails)
+            engines[name] = engine
+        return engines
+
+    def side_by_side_summary(self, verify_integrity=True):
+        return {name: engine.get_summary() for name, engine in self.load_engines(verify_integrity).items()}
+
+    def save_config(self, path):
+        data = [{
+            'name': account.name,
+            'address': account.address,
+            'host': account.host,
+            'port': account.port,
+            'use_ssl': account.use_ssl,
+            'auth_mode': account.auth_mode,
+            'output_dir': account.output_dir,
+        } for account in self.accounts.values()]
+        Path(path).write_text(json.dumps(data, indent=2), encoding='utf-8')
+
+    def load_config(self, path):
+        data = json.loads(Path(path).read_text(encoding='utf-8'))
+        self.accounts.clear()
+        for record in data:
+            self.add(AccountConfig(**record))
+        return self.accounts
+
+
+class OllamaClassifier:
+    """Optional local LLM client for offline classification and vision."""
+
+    def __init__(self, model='llama3.2', endpoint='http://127.0.0.1:11434', opener=None, timeout=120):
+        self.model = model
+        self.endpoint = endpoint.rstrip('/')
+        self.opener = opener or urllib.request.urlopen
+        self.timeout = timeout
+
+    def complete(self, prompt, images=None):
+        payload = {'model': self.model, 'prompt': prompt, 'stream': False}
+        if images:
+            payload['images'] = images
+        request = urllib.request.Request(
+            f'{self.endpoint}/api/generate',
+            data=json.dumps(payload).encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
+        try:
+            with self.opener(request, timeout=self.timeout) as response:
+                data = json.loads(response.read().decode('utf-8'))
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f'Ollama is unavailable at {self.endpoint}: {exc}') from exc
+        return data.get('response', '')
+
+    def classify_domains(self, domain_info, existing_categories):
+        prompt = (
+            'Classify each email domain into the closest existing category. '
+            'Return ONLY a JSON object mapping domain to category.\n'
+            f'Existing categories: {json.dumps(existing_categories)}\n'
+            f'Domains: {json.dumps(domain_info, ensure_ascii=False)}'
+        )
+        match = re.search(r'\{.*\}', self.complete(prompt), re.DOTALL)
+        return json.loads(match.group()) if match else {}
+
+    def classify_receipt_image(self, image_path, ocr_text=''):
+        path = Path(image_path)
+        media_type = mimetypes.guess_type(path.name)[0] or 'image/jpeg'
+        prompt = RECEIPT_VISION_PROMPT
+        if ocr_text:
+            prompt += f'\nSupplemental OCR text (verify against the image):\n{ocr_text[:12000]}'
+        response = self.complete(prompt, [base64.b64encode(path.read_bytes()).decode('ascii')])
+        result = _json_object(response)
+        return result if result else {'raw': response, 'media_type': media_type}
+
+
+def classify_receipt_image_anthropic(image_path, api_key, model='claude-3-5-sonnet-20241022'):
+    """Use Anthropic vision for one image attachment when an API key is supplied."""
+    if not api_key:
+        raise ValueError('An Anthropic API key is required')
+    if not HAS_ANTHROPIC:
+        raise RuntimeError('The anthropic package is not installed')
+    path = Path(image_path)
+    media_type = mimetypes.guess_type(path.name)[0] or 'image/jpeg'
+    if media_type not in ('image/jpeg', 'image/png', 'image/gif', 'image/webp'):
+        raise ValueError(f'Unsupported receipt image type: {media_type}')
+    client = anthropic.Anthropic(api_key=api_key)
+    response = client.messages.create(
+        model=model,
+        max_tokens=600,
+        messages=[{'role': 'user', 'content': [
+            {'type': 'image', 'source': {'type': 'base64', 'media_type': media_type,
+                                         'data': base64.b64encode(path.read_bytes()).decode('ascii')}},
+            {'type': 'text', 'text': 'Extract merchant, date, total amount, currency, and line items as JSON. Return only JSON.'},
+        ]}],
+    )
+    text_response = response.content[0].text
+    match = re.search(r'\{.*\}', text_response, re.DOTALL)
+    return json.loads(match.group()) if match else {'raw': text_response}
+
+
+def extract_receipts(emails):
+    receipts = []
+    for em in emails:
+        body = ''
+        if em.local_path and Path(em.local_path).exists():
+            try:
+                msg = email.message_from_bytes(Path(em.local_path).read_bytes(), policy=email.policy.default)
+                body = extract_message_body(msg, 50000)
+            except OSError:
+                pass
+        fields = extract_receipt_fields(f'{em.subject}\n{body}')
+        if fields['amount'] is not None or fields['merchant']:
+            fields.update({'uid': em.uid, 'sender': em.sender, 'category': em.category})
+            receipts.append(fields)
+    return receipts
+
+
+def load_archive_emails(output_dir, verify_integrity=True):
+    """Load unique local messages from a downloaded archive manifest."""
+    output_dir = Path(output_dir)
+    manifest = load_manifest(output_dir / MANIFEST_FILENAME)
+    issues = validate_manifest(manifest, output_dir, update_missing=False) if verify_integrity else []
+    invalid = {(issue.get('folder'), issue.get('uid')) for issue in issues}
+    emails, seen = [], set()
+    for folder, records in manifest.get('folders', {}).items():
+        if not isinstance(records, dict):
+            continue
+        for uid, info in records.items():
+            if (folder, uid) in invalid or not isinstance(info, dict) or info.get('skipped'):
+                continue
+            message_id = info.get('message_id', '')
+            if message_id and message_id in seen:
+                continue
+            if message_id:
+                seen.add(message_id)
+            emails.append(email_info_from_record(f'{folder}:{uid}', info, folder))
+    return emails, issues
+
+
+def build_cron_entry(script_path, output_dir, schedule='0 2 * * *'):
+    """Return a cron entry for a headless incremental backup."""
+    script = str(Path(script_path).resolve()).replace(' ', '\\ ')
+    output = str(Path(output_dir).resolve()).replace(' ', '\\ ')
+    return f'{schedule} python3 {script} --headless --sync --output-dir {output}'
+
+
+def build_windows_task_args(task_name, script_path, output_dir, schedule='DAILY', start_time='02:00'):
+    return [
+        'schtasks', '/Create', '/F', '/TN', task_name,
+        '/SC', schedule, '/ST', start_time,
+        '/TR', f'"{sys.executable}" "{Path(script_path).resolve()}" --headless --sync --output-dir "{Path(output_dir).resolve()}"',
+    ]
+
+
+def install_windows_scheduled_backup(task_name, script_path, output_dir, schedule='DAILY', start_time='02:00', dry_run=True):
+    """Install a Windows Task Scheduler job, or return its command in dry-run mode."""
+    command = build_windows_task_args(task_name, script_path, output_dir, schedule, start_time)
+    if dry_run:
+        return command
+    return subprocess.run(command, check=True, capture_output=True, text=True)
+
+
 def export_mbox(emails, output_path):
     """Write local EML messages to an interoperable mbox file."""
     output_path = Path(output_path)
@@ -1331,9 +2496,13 @@ class ImapScanWorker(QThread):
     finished_signal = pyqtSignal(list)
     error = pyqtSignal(str)
 
-    def __init__(self, host, addr, pw):
+    def __init__(self, host, addr, pw, port=993, use_ssl=True, auth_mode='password',
+                 access_token='', since=None):
         super().__init__()
         self.host, self.addr, self.pw = host, addr, pw
+        self.port, self.use_ssl = port, use_ssl
+        self.auth_mode, self.access_token = auth_mode, access_token
+        self.since = since
         self._stop = False
 
     def stop(self): self._stop = True
@@ -1341,10 +2510,16 @@ class ImapScanWorker(QThread):
     def run(self):
         try:
             self.status.emit("Connecting...")
-            imap = imaplib.IMAP4_SSL(self.host, 993)
-            imap.login(self.addr, self.pw)
+            imap = open_imap_connection(
+                self.host, self.port, self.use_ssl, self.addr, self.pw,
+                self.auth_mode, self.access_token
+            )
             imap.select('INBOX', readonly=True)
-            _, data = imap.uid('SEARCH', None, 'ALL')
+            since_query = imap_since_query(self.since)
+            if since_query:
+                _, data = imap.uid('SEARCH', None, 'SINCE', since_query)
+            else:
+                _, data = imap.uid('SEARCH', None, 'ALL')
             uids = data[0].split()
             total = len(uids)
             self.status.emit(f"Found {total:,} emails. Scanning...")
@@ -1363,17 +2538,8 @@ class ImapScanWorker(QThread):
                         size = int(sz_m.group(1)) if sz_m else 0
                         idx += 1
                         try:
-                            msg = email.message_from_bytes(item[1])
-                            fd = decode_header(msg.get('From',''))
-                            name, addr = email.utils.parseaddr(fd)
-                            unsub = msg.get('List-Unsubscribe','')
-                            em = EmailInfo(uid=uid, sender=addr or fd, sender_name=name or addr or fd,
-                                subject=decode_header(msg.get('Subject','(no subject)')),
-                                date=msg.get('Date',''), date_parsed=parse_date(msg.get('Date','')),
-                                has_list_unsubscribe=bool(unsub), list_unsubscribe_url=unsub,
-                                source_folder='INBOX', message_id=msg.get('Message-ID',''),
-                                in_reply_to=msg.get('In-Reply-To',''),
-                                references=msg.get('References',''), size_bytes=size)
+                            em = parse_email_message(item[1], uid, 'INBOX', account=self.addr)
+                            em.size_bytes = size
                             batch.append(em); all_emails.append(em)
                         except Exception: pass
                 self.progress.emit(min(i+bs, total), total)
@@ -1587,6 +2753,130 @@ class ImapDownloadWorker(QThread):
                 try: imap.logout()
                 except Exception: pass
             self.error.emit(f"Error: {e}\n{traceback.format_exc()}")
+
+
+class RemoteMimeDownloadWorker(QThread):
+    """Download raw MIME from any paginated source implementing ``iter_messages``."""
+
+    progress = pyqtSignal(int, int)
+    status = pyqtSignal(str)
+    log = pyqtSignal(str)
+    email_saved = pyqtSignal(object)
+    finished_signal = pyqtSignal(list)
+    error = pyqtSignal(str)
+
+    def __init__(self, source, output_dir, folder_name='Imported', options=None, query=''):
+        super().__init__()
+        self.source = source
+        self.output_dir = Path(output_dir)
+        self.folder_name = folder_name
+        self.options = options or SyncOptions()
+        self.query = query
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        manifest_path = self.output_dir / MANIFEST_FILENAME
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            manifest = load_manifest(manifest_path)
+            issues = validate_manifest(manifest, self.output_dir, update_missing=True) \
+                if self.options.verify_integrity else []
+            for issue in issues:
+                manifest.get('folders', {}).get(issue.get('folder'), {}).pop(issue.get('uid'), None)
+            records = manifest.setdefault('folders', {}).setdefault(self.folder_name, {})
+            stored_ids = {info.get('message_id') for info in records.values() if isinstance(info, dict)}
+            stored_ids.discard(None)
+            query = self.query
+            since = self.options.since
+            if since and not query:
+                query = f'after:{since.strftime("%Y/%m/%d")}'
+            messages = list(self.source.iter_messages(query=query))
+            total = len(messages)
+            self.status.emit(f"Found {total:,} remote messages")
+            folder_dir = self.output_dir / 'folders' / sanitize_folder_name(self.folder_name)
+            folder_dir.mkdir(parents=True, exist_ok=True)
+            all_emails = [
+                email_info_from_record(f"{self.folder_name}:{uid}", info, self.folder_name)
+                for uid, info in records.items() if isinstance(info, dict)
+            ]
+            for index, (remote_id, raw, labels) in enumerate(messages):
+                if self._stop:
+                    break
+                remote_id = str(remote_id)
+                if self.options.incremental and remote_id in stored_ids:
+                    self.progress.emit(index + 1, total)
+                    continue
+                if self.options.max_message_size and len(raw) > self.options.max_message_size:
+                    records[remote_id] = {'message_id': remote_id, 'size_bytes': len(raw), 'skipped': True}
+                    continue
+                source_folder = self.folder_name
+                if labels:
+                    source_folder = f"{self.folder_name}/{','.join(map(str, labels))}"
+                em = parse_email_message(raw, f"{self.folder_name}:{remote_id}", source_folder)
+                em.message_id = em.message_id or remote_id
+                if self.options.attachments_only:
+                    extract_attachments_to(raw, self.output_dir, date_value=em.date_parsed)
+                else:
+                    local_path = folder_dir / f'{sanitize_filename(remote_id, 100)}.eml'
+                    local_path.write_bytes(raw)
+                    em.local_path = str(local_path)
+                records[remote_id] = email_info_to_record(em)
+                if em.local_path:
+                    records[remote_id]['sha256'] = sha256_file(em.local_path)
+                    manifest.setdefault('message_ids', {})[em.message_id] = em.local_path
+                all_emails.append(em)
+                stored_ids.add(remote_id)
+                self.email_saved.emit(em)
+                self.progress.emit(index + 1, total)
+            manifest.setdefault('folder_metadata', {}).setdefault(self.folder_name, {}).update({
+                'last_sync': datetime.now().isoformat(timespec='seconds'),
+                'source': type(self.source).__name__,
+            })
+            manifest['sync'] = {'last_successful_at': datetime.now().isoformat(timespec='seconds'), 'query': query}
+            save_manifest(manifest_path, manifest)
+            self.finished_signal.emit(all_emails)
+        except Exception as exc:
+            self.error.emit(f"Error: {exc}\n{traceback.format_exc()}")
+
+
+class GmailApiDownloadWorker(RemoteMimeDownloadWorker):
+    def __init__(self, source, output_dir, options=None, query=''):
+        super().__init__(source, output_dir, 'Gmail API', options, query)
+
+
+class RemoteMimeScanWorker(QThread):
+    progress = pyqtSignal(int, int)
+    status = pyqtSignal(str)
+    email_batch = pyqtSignal(list)
+    finished_signal = pyqtSignal(list)
+    error = pyqtSignal(str)
+
+    def __init__(self, source, query=''):
+        super().__init__()
+        self.source, self.query = source, query
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        try:
+            messages = list(self.source.iter_messages(query=self.query))
+            total = len(messages)
+            result = []
+            for index, (remote_id, raw, labels) in enumerate(messages):
+                if self._stop:
+                    break
+                folder = f"Remote/{','.join(map(str, labels))}" if labels else 'Remote'
+                result.append(parse_email_message(raw, remote_id, folder))
+                self.email_batch.emit([result[-1]])
+                self.progress.emit(index + 1, total)
+            self.finished_signal.emit(result)
+        except Exception as exc:
+            self.error.emit(f"Error: {exc}\n{traceback.format_exc()}")
 
 
 class ImapLabelWorker(QThread):
@@ -1847,6 +3137,55 @@ class AiClassifyWorker(QThread):
         except Exception as e: self.error.emit(str(e))
 
 
+class OllamaClassifyWorker(QThread):
+    progress = pyqtSignal(int, int); status = pyqtSignal(str)
+    classified = pyqtSignal(dict); finished_signal = pyqtSignal(); error = pyqtSignal(str)
+
+    def __init__(self, emails, existing, model='llama3.2', endpoint='http://127.0.0.1:11434'):
+        super().__init__()
+        self.emails, self.existing = emails, existing
+        self.model, self.endpoint = model, endpoint
+        self._stop = False
+
+    def stop(self): self._stop = True
+
+    def run(self):
+        try:
+            grouped = defaultdict(list)
+            for em in self.emails:
+                grouped[em.sender_domain].append(em)
+            info = [{'domain': domain, 'count': len(messages),
+                     'senders': list({em.sender_name for em in messages})[:3],
+                     'subjects': [em.subject for em in messages[:5]]}
+                    for domain, messages in grouped.items()]
+            result = OllamaClassifier(self.model, self.endpoint).classify_domains(info, self.existing)
+            self.classified.emit(result)
+            self.progress.emit(len(info), len(info))
+            self.finished_signal.emit()
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class ReceiptVisionWorker(QThread):
+    progress = pyqtSignal(int, int)
+    status = pyqtSignal(str)
+    finished_signal = pyqtSignal(list)
+    error = pyqtSignal(str)
+
+    def __init__(self, emails, classifier):
+        super().__init__()
+        self.emails, self.classifier = emails, classifier
+
+    def run(self):
+        try:
+            self.status.emit('Classifying receipt and invoice attachments...')
+            receipts = extract_receipt_attachments(self.emails, self.classifier)
+            self.progress.emit(len(self.emails), len(self.emails))
+            self.finished_signal.emit(receipts)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
 class HtmlArchiveWorker(QThread):
     """Generate a static HTML archive from organized emails."""
     progress = pyqtSignal(int, int); log = pyqtSignal(str)
@@ -1948,11 +3287,26 @@ th{{background:#313244;color:#bac2de;position:sticky;top:0}}</style></head><body
 
 class ConnectionTester(QObject):
     success = pyqtSignal(int); error = pyqtSignal(str)
-    def __init__(self, host, addr, pw):
-        super().__init__(); self.host, self.addr, self.pw = host, addr, pw
+    def __init__(self, host, addr, pw, port=993, use_ssl=True, auth_mode='password', access_token='', backend='imap'):
+        super().__init__()
+        self.host, self.addr, self.pw = host, addr, pw
+        self.port, self.use_ssl = port, use_ssl
+        self.auth_mode, self.access_token = auth_mode, access_token
+        self.backend = backend
     def run(self):
         try:
-            imap = imaplib.IMAP4_SSL(self.host, 993); imap.login(self.addr, self.pw)
+            if self.backend == 'gmail_api':
+                labels = GmailApiSource(self.access_token, self.addr).list_labels()
+                self.success.emit(len(labels))
+                return
+            if self.backend == 'graph':
+                count = sum(1 for _ in GraphMailSource(self.access_token).iter_message_refs())
+                self.success.emit(count)
+                return
+            imap = open_imap_connection(
+                self.host, self.port, self.use_ssl, self.addr, self.pw,
+                self.auth_mode, self.access_token
+            )
             _, d = imap.select('INBOX', readonly=True); c = int(d[0])
             imap.close(); imap.logout(); self.success.emit(c)
         except Exception as e: self.error.emit(str(e))
@@ -2153,6 +3507,22 @@ class StatsDialog(QDialog):
             quota_bar.setMaximum(100); quota_bar.setValue(pct); quota_bar.setFixedHeight(12)
             quota_bar.setStyleSheet(f"QProgressBar::chunk {{ background-color: {color}; border-radius: 4px; }}")
             cl.addWidget(quota_bar)
+
+        health = engine.sender_health()[:15]
+        if health:
+            cl.addWidget(HBarChart([(item['sender'], item['score']) for item in health], "Sender Health Score"))
+        latency = engine.reply_latency()
+        if latency:
+            cl.addWidget(HBarChart(list(latency.items()), "Reply Latency"))
+        forecast = engine.storage_forecast(12)
+        if forecast['forecast']:
+            projected = forecast['forecast'][-1]['projected_bytes']
+            forecast_label = QLabel(
+                f"Storage forecast: {format_size(projected)} in 12 months "
+                f"({format_size(forecast['average_monthly_bytes'])}/month average)"
+            )
+            forecast_label.setStyleSheet(f"color:{C.SUBTEXT0};font-size:14px;margin-top:8px;")
+            cl.addWidget(forecast_label)
 
         cl.addStretch()
         scroll.setWidget(content)
@@ -2436,6 +3806,11 @@ class ConnectPage(QWidget):
     def __init__(self):
         super().__init__()
         self.imap_host = "imap.gmail.com"
+        self.imap_port = 993
+        self.use_ssl = True
+        self.auth_mode = "oauth2"
+        self.access_token = ""
+        self.backend = "imap"
         self.email_addr = self.password = self.download_dir = ""
         self.loaded_engine = None
         self._build_ui()
@@ -2452,13 +3827,38 @@ class ConnectPage(QWidget):
         layout.addSpacing(20)
 
         form = QWidget(); form.setMaximumWidth(520); fl = QVBoxLayout(form); fl.setSpacing(12)
+        backend_row = QHBoxLayout()
+        backend_row.addWidget(QLabel("Backend"))
+        self.backend_combo = QComboBox()
+        self.backend_combo.addItem("IMAP (generic/Gmail)", "imap")
+        self.backend_combo.addItem("Gmail API", "gmail_api")
+        self.backend_combo.addItem("Microsoft Graph", "graph")
+        self.backend_combo.currentIndexChanged.connect(self._backend_changed)
+        backend_row.addWidget(self.backend_combo, 1)
+        fl.addLayout(backend_row)
+        server_row = QHBoxLayout()
+        server_row.addWidget(QLabel("Mail server"))
+        self.host_input = QLineEdit(self.imap_host); self.host_input.setPlaceholderText("imap.gmail.com")
+        server_row.addWidget(self.host_input, 1)
+        self.port_input = QSpinBox(); self.port_input.setRange(1, 65535); self.port_input.setValue(993)
+        self.port_input.setMaximumWidth(90); server_row.addWidget(self.port_input)
+        self.ssl_check = QCheckBox("SSL"); self.ssl_check.setChecked(True); server_row.addWidget(self.ssl_check)
+        fl.addLayout(server_row)
         fl.addWidget(QLabel("Gmail Address"))
         self.email_input = QLineEdit(); self.email_input.setPlaceholderText("you@gmail.com")
         fl.addWidget(self.email_input)
-        fl.addWidget(QLabel("App Password"))
+        auth_row = QHBoxLayout()
+        auth_row.addWidget(QLabel("Authentication"))
+        self.auth_combo = QComboBox()
+        self.auth_combo.addItems(["OAuth2 access token (recommended)", "App Password"])
+        self.auth_combo.currentIndexChanged.connect(self._auth_changed)
+        auth_row.addWidget(self.auth_combo, 1)
+        fl.addLayout(auth_row)
+        self.credential_label = QLabel("OAuth2 access token")
+        fl.addWidget(self.credential_label)
         self.pass_input = QLineEdit(); self.pass_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.pass_input.setPlaceholderText("16-character app password"); fl.addWidget(self.pass_input)
-        hint = QLabel("Google Account > Security > 2-Step Verification > App Passwords")
+        self.pass_input.setPlaceholderText("Paste an access token"); fl.addWidget(self.pass_input)
+        hint = QLabel("OAuth2 is preferred. Use an App Password only when OAuth2 is unavailable.")
         hint.setStyleSheet(f"color:{C.SUBTEXT0}; font-size:11px;"); hint.setWordWrap(True)
         fl.addWidget(hint); fl.addSpacing(12)
 
@@ -2524,11 +3924,37 @@ class ConnectPage(QWidget):
         for b in (self.scan_btn, self.dl_btn, self.load_scan_btn, self.load_local_btn,
                   self.load_mbox_btn, self.load_tb_btn): b.setEnabled(en)
 
+    def _auth_changed(self, index):
+        oauth = index == 0
+        self.credential_label.setText("OAuth2 access token" if oauth else "App Password")
+        self.pass_input.setPlaceholderText("Paste an access token" if oauth else "16-character app password")
+
+    def _backend_changed(self, index):
+        self.backend = self.backend_combo.itemData(index)
+        is_imap = self.backend == 'imap'
+        self.host_input.setEnabled(is_imap)
+        self.port_input.setEnabled(is_imap)
+        self.ssl_check.setEnabled(is_imap)
+        if not is_imap:
+            self.auth_combo.setCurrentIndex(0)
+            self.auth_combo.setEnabled(False)
+            self.credential_label.setText("OAuth2 access token")
+            self.pass_input.setPlaceholderText("Paste an access token")
+        else:
+            self.auth_combo.setEnabled(True)
+            self._auth_changed(self.auth_combo.currentIndex())
+
     def _on_action(self, mode):
+        self.imap_host = self.host_input.text().strip() or "imap.gmail.com"
+        self.imap_port = self.port_input.value()
+        self.use_ssl = self.ssl_check.isChecked()
+        self.auth_mode = "oauth2" if self.auth_combo.currentIndex() == 0 else "password"
+        self.backend = self.backend_combo.currentData()
         self.email_addr = self.email_input.text().strip()
         self.password = self.pass_input.text().strip()
+        self.access_token = self.password if self.auth_mode == "oauth2" else ""
         if not self.email_addr or not self.password:
-            self.status_label.setText("Enter email and app password")
+            self.status_label.setText("Enter an email address and credential")
             self.status_label.setStyleSheet(f"color:{C.RED};"); return
         if mode == "download":
             f = QFileDialog.getExistingDirectory(self, "Download Folder",
@@ -2537,7 +3963,10 @@ class ConnectPage(QWidget):
             self.download_dir = f
         self.status_label.setText("Testing..."); self.status_label.setStyleSheet(f"color:{C.YELLOW};")
         self._set_btns(False); self._mode = mode
-        self._tt = QThread(); self._tw = ConnectionTester(self.imap_host, self.email_addr, self.password)
+        self._tt = QThread(); self._tw = ConnectionTester(
+            self.imap_host, self.email_addr, self.password, self.imap_port,
+            self.use_ssl, self.auth_mode, self.access_token, self.backend
+        )
         self._tw.moveToThread(self._tt); self._tt.started.connect(self._tw.run)
         self._tw.success.connect(self._ok); self._tw.error.connect(self._fail); self._tt.start()
 
@@ -2689,10 +4118,24 @@ class DownloadPage(QWidget):
         self.cont_btn.clicked.connect(self.download_complete.emit); bot.addWidget(self.cont_btn)
         layout.addLayout(bot)
 
-    def start_download(self, host, addr, pw, out_dir, options=None):
+    def start_download(self, host, addr, pw, out_dir, options=None, port=993, use_ssl=True,
+                       auth_mode='password', access_token=''):
         ud = addr.split('@')[1] if '@' in addr else ""
         self.engine = CategoryEngine(ud); self._out = out_dir; self._n = 0
-        self.worker = ImapDownloadWorker(host, addr, pw, out_dir, options=options)
+        self.worker = ImapDownloadWorker(
+            host, addr, pw, out_dir, options=options, port=port, use_ssl=use_ssl,
+            auth_mode=auth_mode, access_token=access_token
+        )
+        self._wire_worker()
+
+    def start_remote_download(self, source, out_dir, options=None, query=''):
+        self.engine = CategoryEngine(''); self._out = str(out_dir); self._n = 0
+        worker_cls = GmailApiDownloadWorker if isinstance(source, GmailApiSource) else RemoteMimeDownloadWorker
+        self.worker = worker_cls(source, out_dir, options, query) if worker_cls is GmailApiDownloadWorker \
+            else worker_cls(source, out_dir, type(source).__name__, options, query)
+        self._wire_worker()
+
+    def _wire_worker(self):
         self.worker.progress.connect(lambda c,t: (self.progress.setMaximum(t), self.progress.setValue(c),
             self.pct.setText(f"{int(c/t*100) if t else 0}% ({c:,}/{t:,})")))
         self.worker.status.connect(self.status_label.setText)
@@ -2758,10 +4201,25 @@ class AnalyzePage(QWidget):
         self.cont_btn.clicked.connect(self.analysis_complete.emit); bot.addWidget(self.cont_btn)
         layout.addLayout(bot)
 
-    def start_scan(self, host, addr, pw):
+    def start_scan(self, host, addr, pw, port=993, use_ssl=True, auth_mode='password',
+                   access_token='', since=None):
         ud = addr.split('@')[1] if '@' in addr else ""
         self.engine = CategoryEngine(ud); self._dc = Counter()
-        self.worker = ImapScanWorker(host, addr, pw)
+        self.worker = ImapScanWorker(
+            host, addr, pw, port, use_ssl, auth_mode, access_token, since
+        )
+        self.worker.progress.connect(lambda c,t: (self.progress.setMaximum(t), self.progress.setValue(c),
+            self.pct.setText(f"{int(c/t*100) if t else 0}% ({c:,}/{t:,})")))
+        self.worker.status.connect(self.status_label.setText)
+        self.worker.email_batch.connect(self._batch)
+        self.worker.finished_signal.connect(self._finished)
+        self.worker.error.connect(lambda e: (self.status_label.setText(e),
+            self.status_label.setStyleSheet(f"color:{C.RED};")))
+        self.worker.start()
+
+    def start_remote_scan(self, source, query=''):
+        self.engine = CategoryEngine(''); self._dc = Counter()
+        self.worker = RemoteMimeScanWorker(source, query)
         self.worker.progress.connect(lambda c,t: (self.progress.setMaximum(t), self.progress.setValue(c),
             self.pct.setText(f"{int(c/t*100) if t else 0}% ({c:,}/{t:,})")))
         self.worker.status.connect(self.status_label.setText)
@@ -2837,10 +4295,13 @@ class ReviewPage(QWidget):
             ("Contacts", self._show_contacts, "Contact frequency analysis"),
             ("Subscriptions", self._show_subs, "Newsletter management"),
             ("Rules", self._show_rules, "Auto clean rules editor"),
+            ("Inbox Zero", self._show_inbox_zero, "Preview archive and unsubscribe suggestions"),
+            ("Location Timeline", self._show_location_timeline, "Audit public IP hops from Received headers"),
         ]:
             b = QPushButton(name); b.setProperty("secondary", True)
             b.setToolTip(tip); b.clicked.connect(slot); tb2.addWidget(b)
             if name == "Contacts": self.contacts_btn = b
+            if name == "Location Timeline": self.location_btn = b
 
         # Export menu
         self.export_btn = QPushButton("Export"); self.export_btn.setProperty("secondary", True)
@@ -2848,6 +4309,10 @@ class ReviewPage(QWidget):
         export_menu.addAction("CSV", self._export_csv)
         export_menu.addAction("JSON", self._export_json)
         export_menu.addAction("MBOX", self._export_mbox)
+        export_menu.addAction("Markdown Vault", self._export_markdown)
+        export_menu.addAction("PDF", self._export_pdf)
+        export_menu.addAction("Relationship Graph", self._export_graph)
+        export_menu.addAction("Contact Graph", self._export_contact_graph)
         export_menu.addAction("HTML Archive", self._export_html)
         export_menu.addAction("Encrypted Archive", self._export_encrypted)
         self.export_btn.setMenu(export_menu); tb2.addWidget(self.export_btn)
@@ -2861,6 +4326,12 @@ class ReviewPage(QWidget):
         self.redact_btn.clicked.connect(self._redact_sensitive); tb2.addWidget(self.redact_btn)
         self.ai_btn = QPushButton("AI Classify"); self.ai_btn.setProperty("secondary", True)
         self.ai_btn.clicked.connect(self._ai_classify); tb2.addWidget(self.ai_btn)
+        self.local_ai_btn = QPushButton("Local AI"); self.local_ai_btn.setProperty("secondary", True)
+        self.local_ai_btn.clicked.connect(self._ollama_classify); tb2.addWidget(self.local_ai_btn)
+        self.receipts_btn = QPushButton("Receipts"); self.receipts_btn.setProperty("secondary", True)
+        self.receipts_btn.clicked.connect(self._show_receipts); tb2.addWidget(self.receipts_btn)
+        self.receipt_vision_btn = QPushButton("Receipt Vision"); self.receipt_vision_btn.setProperty("secondary", True)
+        self.receipt_vision_btn.clicked.connect(self._run_receipt_vision); tb2.addWidget(self.receipt_vision_btn)
         self.thread_btn = QPushButton("Threads"); self.thread_btn.setProperty("secondary", True)
         self.thread_btn.clicked.connect(self._summarize_threads); tb2.addWidget(self.thread_btn)
         layout.addLayout(tb2)
@@ -3010,6 +4481,11 @@ class ReviewPage(QWidget):
         self.attach_btn.setEnabled(has_local)
         self.sensitive_btn.setEnabled(has_local)
         self.redact_btn.setEnabled(has_local)
+        self.ai_btn.setEnabled(has_local and HAS_ANTHROPIC)
+        self.local_ai_btn.setEnabled(has_local)
+        self.receipts_btn.setEnabled(has_local)
+        self.receipt_vision_btn.setEnabled(has_local)
+        self.location_btn.setEnabled(has_local)
         self.thread_btn.setEnabled(has_local and HAS_ANTHROPIC)
 
     def _refresh_tree(self, *_):
@@ -3095,10 +4571,9 @@ class ReviewPage(QWidget):
     def _apply_filter(self, *_):
         """Filter current email list by search text and date range."""
         emails = self._all_current_emails
-        q = self.search_input.text().lower().strip()
+        q = self.search_input.text().strip()
         if q:
-            emails = [em for em in emails if q in (em.subject or '').lower()
-                      or q in (em.sender_name or '').lower() or q in (em.sender or '').lower()]
+            emails = search_emails(emails, q)
         d_from = self.date_from.date().toPyDate()
         d_to = self.date_to.date().toPyDate()
         from datetime import date as dt_date
@@ -3231,6 +4706,59 @@ class ReviewPage(QWidget):
         if self.engine:
             RulesEditorDialog(self.engine.clean_rules, list(self.engine.categories.keys()), self).exec()
 
+    def _show_inbox_zero(self):
+        if not self.engine:
+            return
+        suggestions = self.engine.inbox_zero_suggestions()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Inbox Zero Suggestions (preview only)")
+        dialog.setMinimumSize(650, 450)
+        layout = QVBoxLayout(dialog)
+        text = QPlainTextEdit(); text.setReadOnly(True)
+        lines = [f"{len(suggestions):,} suggestions — nothing will be changed"]
+        for suggestion in suggestions[:1000]:
+            lines.append(f"{suggestion['uid']}: {suggestion['action']} ({suggestion['reason']})")
+        text.setPlainText('\n'.join(lines)); layout.addWidget(text)
+        close = QPushButton("Close"); close.clicked.connect(dialog.close); layout.addWidget(close)
+        dialog.exec()
+
+    def _show_location_timeline(self):
+        if not self.engine:
+            return
+        timeline = self.engine.location_timeline()
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Location Timeline ({len(timeline):,} public hops)")
+        dialog.setMinimumSize(780, 480)
+        layout = QVBoxLayout(dialog)
+        table = QTableWidget(len(timeline), 5)
+        table.setHorizontalHeaderLabels(["Received", "IP", "Country", "UID", "Hop"])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        for row, item in enumerate(timeline):
+            table.setItem(row, 0, QTableWidgetItem(item.get('received_at') or item.get('date', '')))
+            table.setItem(row, 1, QTableWidgetItem(item.get('ip', '')))
+            table.setItem(row, 2, QTableWidgetItem(item.get('country', '')))
+            table.setItem(row, 3, QTableWidgetItem(item.get('uid', '')))
+            table.setItem(row, 4, QTableWidgetItem(str(item.get('hop', ''))))
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        layout.addWidget(table)
+        buttons = QHBoxLayout()
+        export = QPushButton("Export CSV")
+        export.clicked.connect(lambda: self._export_location_timeline(timeline))
+        buttons.addWidget(export)
+        close = QPushButton("Close"); close.clicked.connect(dialog.close); buttons.addWidget(close)
+        layout.addLayout(buttons)
+        dialog.exec()
+
+    def _export_location_timeline(self, timeline):
+        path, _ = QFileDialog.getSaveFileName(self, "Export location timeline", "location_timeline.csv", "CSV (*.csv)")
+        if not path:
+            return
+        export_location_timeline_csv(timeline, path)
+        QMessageBox.information(self, "Exported", f"Wrote {len(timeline):,} location hops to:\n{path}")
+
     def _export_csv(self):
         if not self.engine: return
         p, _ = QFileDialog.getSaveFileName(self, "Export CSV", "gmaildownloader_export.csv", "CSV (*.csv)")
@@ -3270,6 +4798,52 @@ class ReviewPage(QWidget):
             QMessageBox.information(self, "Encrypted", f"Encrypted archive written to:\n{p}")
         except Exception as exc:
             QMessageBox.warning(self, "Encryption failed", str(exc))
+
+    def _export_markdown(self):
+        if not self.engine: return
+        destination = QFileDialog.getExistingDirectory(self, "Markdown vault folder")
+        if destination:
+            try:
+                files = self.engine.export_markdown(destination)
+                QMessageBox.information(self, "Exported", f"Wrote {len(files):,} Markdown notes")
+            except Exception as exc:
+                QMessageBox.warning(self, "Export failed", str(exc))
+
+    def _export_pdf(self):
+        if not self.engine: return
+        p, _ = QFileDialog.getSaveFileName(self, "Export PDF", "gmaildownloader.pdf", "PDF (*.pdf)")
+        if p:
+            try:
+                self.engine.export_pdf(p)
+                QMessageBox.information(self, "Exported", f"PDF written to:\n{p}")
+            except Exception as exc:
+                QMessageBox.warning(self, "Export failed", str(exc))
+
+    def _export_graph(self):
+        if not self.engine: return
+        p, _ = QFileDialog.getSaveFileName(
+            self, "Export relationship graph", "relationships.json",
+            "JSON (*.json);;GraphML (*.graphml)"
+        )
+        if p:
+            try:
+                self.engine.export_relationship_graph(p)
+                QMessageBox.information(self, "Exported", f"Graph written to:\n{p}")
+            except Exception as exc:
+                QMessageBox.warning(self, "Export failed", str(exc))
+
+    def _export_contact_graph(self):
+        if not self.engine: return
+        p, _ = QFileDialog.getSaveFileName(
+            self, "Export contact graph", "contacts.json",
+            "JSON (*.json);;GraphML (*.graphml)"
+        )
+        if p:
+            try:
+                self.engine.export_contact_graph(p)
+                QMessageBox.information(self, "Exported", f"Graph written to:\n{p}")
+            except Exception as exc:
+                QMessageBox.warning(self, "Export failed", str(exc))
 
     def _export_html(self):
         if not self.engine or not self._dl_dir: return
@@ -3348,6 +4922,103 @@ class ReviewPage(QWidget):
             self, "Redacted copies", f"Wrote {written:,} redacted EML copies to:\n{destination}"
         )
 
+    def _ollama_classify(self):
+        if not self.engine:
+            return
+        candidates = self.engine.confidence_candidates(0.75)
+        if not candidates:
+            QMessageBox.information(self, "Done", "No low-confidence messages to classify.")
+            return
+        self.local_ai_btn.setEnabled(False); self.local_ai_btn.setText("Classifying...")
+        existing = [category for category in self.engine.categories if category != "Uncategorized"]
+        self._ai_candidates = candidates
+        self._ollama_w = OllamaClassifyWorker(candidates, existing)
+        self._ollama_w.classified.connect(self._ai_result)
+        self._ollama_w.finished_signal.connect(
+            lambda: (self.local_ai_btn.setEnabled(True), self.local_ai_btn.setText("Local AI"))
+        )
+        self._ollama_w.error.connect(
+            lambda error: (self.local_ai_btn.setEnabled(True), self.local_ai_btn.setText("Local AI"),
+                           QMessageBox.warning(self, "Local AI error", error))
+        )
+        self._ollama_w.start()
+
+    def _show_receipts(self):
+        if not self.engine:
+            return
+        receipts = extract_receipts(self.engine.emails)
+        self._present_receipts(receipts, f"Receipt Extraction ({len(receipts):,})")
+
+    def _present_receipts(self, receipts, title):
+        dialog = QDialog(self); dialog.setWindowTitle(title)
+        dialog.setMinimumSize(700, 450)
+        layout = QVBoxLayout(dialog)
+        table = QTableWidget(len(receipts), 5)
+        table.setHorizontalHeaderLabels(["Merchant", "Amount", "Date", "Sender", "UID"])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for row, receipt in enumerate(receipts):
+            table.setItem(row, 0, QTableWidgetItem(receipt.get('merchant', '')))
+            amount = receipt.get('amount')
+            table.setItem(row, 1, QTableWidgetItem(f"{amount:.2f}" if amount is not None else ""))
+            table.setItem(row, 2, QTableWidgetItem(receipt.get('date', '')))
+            table.setItem(row, 3, QTableWidgetItem(receipt.get('sender', '')))
+            table.setItem(row, 4, QTableWidgetItem(receipt.get('uid', '')))
+        layout.addWidget(table)
+        buttons = QHBoxLayout()
+        export = QPushButton("Export OFX")
+        export.clicked.connect(lambda: self._export_receipts_ofx(receipts))
+        buttons.addWidget(export)
+        close = QPushButton("Close"); close.clicked.connect(dialog.close); buttons.addWidget(close)
+        layout.addLayout(buttons)
+        dialog.exec()
+
+    def _export_receipts_ofx(self, receipts):
+        path, _ = QFileDialog.getSaveFileName(self, "Export receipts as OFX", "receipts.ofx", "OFX (*.ofx)")
+        if not path:
+            return
+        try:
+            export_receipts_ofx(receipts, path)
+            QMessageBox.information(self, "Exported", f"Wrote {len(receipts):,} receipts to:\n{path}")
+        except Exception as exc:
+            QMessageBox.warning(self, "OFX export failed", str(exc))
+
+    def _run_receipt_vision(self):
+        if not self.engine:
+            return
+        choices = ["Anthropic (cloud)", "Ollama (local)"]
+        choice, ok = QInputDialog.getItem(self, "Receipt Vision Backend", "Backend", choices, 0, False)
+        if not ok:
+            return
+        backend = 'anthropic' if choice.startswith('Anthropic') else 'ollama'
+        api_key = ''
+        if backend == 'anthropic':
+            if not HAS_ANTHROPIC:
+                QMessageBox.warning(self, "Missing dependency", "Install the anthropic package first.")
+                return
+            api_key, ok = QInputDialog.getText(
+                self, "Anthropic API Key", "Analyze receipt/invoice attachments with Claude",
+                QLineEdit.EchoMode.Password
+            )
+            if not ok or not api_key:
+                return
+        self.receipt_vision_btn.setEnabled(False); self.receipt_vision_btn.setText("Vision...")
+        classifier = ReceiptVisionClassifier(backend=backend, api_key=api_key)
+        self._receipt_vision_worker = ReceiptVisionWorker(self.engine.emails, classifier)
+        self._receipt_vision_worker.finished_signal.connect(self._receipt_vision_done)
+        self._receipt_vision_worker.error.connect(self._receipt_vision_error)
+        self._receipt_vision_worker.start()
+
+    def _receipt_vision_done(self, receipts):
+        self.receipt_vision_btn.setEnabled(True); self.receipt_vision_btn.setText("Receipt Vision")
+        if receipts:
+            self._present_receipts(receipts, f"Receipt Vision ({len(receipts):,})")
+        else:
+            QMessageBox.information(self, "Receipt Vision", "No receipt or invoice attachments were classified.")
+
+    def _receipt_vision_error(self, error):
+        self.receipt_vision_btn.setEnabled(True); self.receipt_vision_btn.setText("Receipt Vision")
+        QMessageBox.warning(self, "Receipt Vision failed", error)
+
     def _ai_classify(self):
         if not HAS_ANTHROPIC:
             QMessageBox.warning(self, "Missing", "anthropic package not installed."); return
@@ -3359,6 +5030,7 @@ class ReviewPage(QWidget):
         if not ok or not key: return
         self.ai_btn.setEnabled(False); self.ai_btn.setText("Classifying...")
         existing = [k for k in self.engine.categories if k != "Uncategorized"]
+        self._ai_candidates = uncat
         self._ai_w = AiClassifyWorker(key, uncat, existing)
         self._ai_w.classified.connect(self._ai_result)
         self._ai_w.finished_signal.connect(self._ai_done)
@@ -3366,16 +5038,22 @@ class ReviewPage(QWidget):
         self._ai_w.start()
 
     def _ai_result(self, dmap):
+        candidates = getattr(self, '_ai_candidates', self.engine.categories.get("Uncategorized", []))
         for domain, cat in dmap.items():
-            moves = [e for e in self.engine.categories.get("Uncategorized", []) if e.sender_domain == domain]
+            moves = [e for e in candidates if e.sender_domain == domain]
             for em in moves:
-                self.engine.categories["Uncategorized"].remove(em)
+                old = em.category
+                if old in self.engine.categories:
+                    self.engine.categories[old] = [item for item in self.engine.categories[old] if item.uid != em.uid]
+                    if not self.engine.categories[old]:
+                        del self.engine.categories[old]
                 em.category = cat; em.confidence = 0.75
                 self.engine.categories[cat].append(em)
                 self.engine.learned.learn(em, cat)
         if not self.engine.categories.get("Uncategorized"):
             if "Uncategorized" in self.engine.categories: del self.engine.categories["Uncategorized"]
         self.engine.learned.save()
+        self._ai_candidates = []
         self._refresh_tree(); self._refresh_combo()
 
     def _ai_done(self):
@@ -3442,9 +5120,13 @@ class ExecutePage(QWidget):
         self.done_lbl = QLabel(""); bot.addWidget(self.done_lbl)
         layout.addLayout(bot)
 
-    def start_gmail(self, host, addr, pw, cats, prefix, archive, dry_run=True):
+    def start_gmail(self, host, addr, pw, cats, prefix, archive, dry_run=True,
+                    port=993, use_ssl=True, auth_mode='password', access_token=''):
         self.title_lbl.setText("Previewing Gmail Labels" if dry_run else "Applying Gmail Labels")
-        self.worker = ImapLabelWorker(host, addr, pw, cats, prefix, archive, dry_run=dry_run)
+        self.worker = ImapLabelWorker(
+            host, addr, pw, cats, prefix, archive, dry_run=dry_run,
+            port=port, use_ssl=use_ssl, auth_mode=auth_mode, access_token=access_token
+        )
         self._wire()
 
     def start_local(self, cats, out_dir, copy):
@@ -3513,13 +5195,33 @@ class MainWindow(QMainWindow):
             self.ap.set_preloaded(self.cp.loaded_engine); self.stack.setCurrentWidget(self.ap)
         elif mode == "download":
             self._dl_dir = self.cp.download_dir; self.stack.setCurrentWidget(self.dp)
-            self.dp.start_download(
-                self.cp.imap_host, self.cp.email_addr, self.cp.password, self._dl_dir,
-                self.cp.sync_options()
-            )
+            options = self.cp.sync_options()
+            if self.cp.backend == 'gmail_api':
+                source = GmailApiSource(self.cp.access_token, 'me')
+                self.dp.start_remote_download(source, self._dl_dir, options)
+            elif self.cp.backend == 'graph':
+                source = GraphMailSource(self.cp.access_token)
+                self.dp.start_remote_download(source, self._dl_dir, options)
+            else:
+                self.dp.start_download(
+                    self.cp.imap_host, self.cp.email_addr, self.cp.password, self._dl_dir,
+                    options, self.cp.imap_port, self.cp.use_ssl,
+                    self.cp.auth_mode, self.cp.access_token
+                )
         else:
             self.stack.setCurrentWidget(self.ap)
-            self.ap.start_scan(self.cp.imap_host, self.cp.email_addr, self.cp.password)
+            since = self.cp.sync_options().since
+            if self.cp.backend == 'gmail_api':
+                self.ap.start_remote_scan(GmailApiSource(self.cp.access_token, 'me'),
+                                          f"after:{since.strftime('%Y/%m/%d')}" if since else '')
+            elif self.cp.backend == 'graph':
+                self.ap.start_remote_scan(GraphMailSource(self.cp.access_token))
+            else:
+                self.ap.start_scan(
+                    self.cp.imap_host, self.cp.email_addr, self.cp.password,
+                    self.cp.imap_port, self.cp.use_ssl, self.cp.auth_mode,
+                    self.cp.access_token, since
+                )
 
     def _dl_done(self):
         self.ap.set_preloaded(self.dp.engine); self.stack.setCurrentWidget(self.ap)
@@ -3541,6 +5243,9 @@ class MainWindow(QMainWindow):
             self.ep.start_local(cats, self._dl_dir or str(Path.home()/"Desktop"/"GmailDownloader"),
                 self.rp.copy_radio.isChecked())
         else:
+            if self.cp.backend != 'imap':
+                QMessageBox.warning(self, "Unavailable", "Gmail label application is currently available through IMAP only.")
+                return
             if not self.cp.email_addr or not self.cp.password:
                 QMessageBox.warning(self, "Credentials", "Enter Gmail credentials."); return
             dry_run = self.rp.dry_run_chk.isChecked()
@@ -3555,14 +5260,138 @@ class MainWindow(QMainWindow):
                     return
             self.stack.setCurrentWidget(self.ep)
             self.ep.start_gmail(self.cp.imap_host, self.cp.email_addr, self.cp.password,
-                cats, self.rp.prefix_input.text().strip(), self.rp.archive_chk.isChecked(), dry_run)
+                cats, self.rp.prefix_input.text().strip(), self.rp.archive_chk.isChecked(), dry_run,
+                self.cp.imap_port, self.cp.use_ssl, self.cp.auth_mode, self.cp.access_token)
 
 
-def main():
-    app = QApplication(sys.argv); app.setStyleSheet(STYLESHEET); app.setStyle("Fusion")
+def build_cli_parser():
+    parser = argparse.ArgumentParser(description='GmailDownloader backup and archive tools')
+    parser.add_argument('--headless', action='store_true', help='run without starting the Qt window')
+    parser.add_argument('--sync', action='store_true', help='run an incremental source sync')
+    parser.add_argument('--source', choices=('imap', 'gmail-api', 'graph'), default='imap')
+    parser.add_argument('--output-dir', default=os.environ.get('GMAIL_OUTPUT_DIR', 'GmailDownloader'))
+    parser.add_argument('--address', default=os.environ.get('GMAIL_ADDRESS', ''))
+    parser.add_argument('--secret', default=os.environ.get('GMAIL_APP_PASSWORD', ''))
+    parser.add_argument('--access-token', default=os.environ.get('GMAIL_ACCESS_TOKEN', ''))
+    parser.add_argument('--host', default=os.environ.get('GMAIL_IMAP_HOST', 'imap.gmail.com'))
+    parser.add_argument('--port', type=int, default=int(os.environ.get('GMAIL_IMAP_PORT', '993')))
+    parser.add_argument('--no-ssl', action='store_true')
+    parser.add_argument('--since', help='only sync messages on or after YYYY-MM-DD')
+    parser.add_argument('--full-sync', action='store_true', help='ignore the last incremental UID')
+    parser.add_argument('--no-verify', action='store_true', help='skip local manifest hash checks')
+    parser.add_argument('--attachments-only', action='store_true')
+    parser.add_argument('--query', default='')
+    parser.add_argument('--import-mbox')
+    parser.add_argument('--import-thunderbird')
+    parser.add_argument('--load-dir', help='load an existing downloaded archive')
+    parser.add_argument('--search', help='search imported messages using Gmail-like operators')
+    parser.add_argument('--export-json')
+    parser.add_argument('--export-markdown')
+    parser.add_argument('--export-pdf')
+    parser.add_argument('--export-mbox')
+    parser.add_argument('--export-graph')
+    parser.add_argument('--export-receipts-ofx')
+    parser.add_argument('--export-location-timeline')
+    return parser
+
+
+def _unique_emails(emails):
+    seen, result = set(), []
+    for em in emails:
+        if em.message_id and em.message_id in seen:
+            continue
+        if em.message_id:
+            seen.add(em.message_id)
+        result.append(em)
+    return result
+
+
+def run_headless(args):
+    output_dir = Path(args.output_dir)
+    emails = []
+    errors = []
+    if args.sync:
+        options = SyncOptions(
+            since=parse_since_date(args.since),
+            incremental=not args.full_sync,
+            verify_integrity=not args.no_verify,
+            attachments_only=args.attachments_only,
+        )
+        if args.source == 'gmail-api':
+            token = args.access_token or args.secret
+            worker = GmailApiDownloadWorker(GmailApiSource(token, 'me'), output_dir, options, args.query)
+        elif args.source == 'graph':
+            token = args.access_token or args.secret
+            worker = RemoteMimeDownloadWorker(GraphMailSource(token), output_dir, 'Microsoft Graph', options, args.query)
+        else:
+            secret = args.access_token if args.access_token and args.secret == '' else args.secret
+            worker = ImapDownloadWorker(
+                args.host, args.address, secret, output_dir, options=options,
+                port=args.port, use_ssl=not args.no_ssl,
+                auth_mode='oauth2' if args.access_token else 'password',
+                access_token=args.access_token,
+            )
+        worker.status.connect(print)
+        if hasattr(worker, 'log'):
+            worker.log.connect(print)
+        worker.error.connect(errors.append)
+        worker.finished_signal.connect(emails.extend)
+        worker.run()
+    elif args.import_mbox:
+        emails = import_mbox(args.import_mbox, output_dir, attachments_only=args.attachments_only)
+    elif args.import_thunderbird:
+        emails = import_thunderbird_profile(args.import_thunderbird, output_dir)
+    elif args.load_dir:
+        emails, issues = load_archive_emails(args.load_dir, not args.no_verify)
+        for issue in issues:
+            print(f"Manifest warning: {issue}", file=sys.stderr)
+    else:
+        raise ValueError('headless mode requires --sync, --import-mbox, --import-thunderbird, or --load-dir')
+    if errors:
+        for error in errors:
+            print(error, file=sys.stderr)
+        return 1
+    emails = _unique_emails(emails)
+    domain = args.address.split('@', 1)[1] if '@' in args.address else ''
+    engine = CategoryEngine(domain)
+    engine.process_all(emails)
+    summary = engine.get_summary()
+    print(f"{summary['total']:,} emails | {summary['categorized']:,} categorized | {summary['uncategorized']:,} uncategorized")
+    if args.search:
+        print(json.dumps([email_info_to_record(em) for em in engine.search(args.search)], ensure_ascii=False, indent=2))
+    if args.export_json:
+        engine.export_json(args.export_json)
+    if args.export_markdown:
+        engine.export_markdown(args.export_markdown)
+    if args.export_pdf:
+        engine.export_pdf(args.export_pdf)
+    if args.export_mbox:
+        engine.export_mbox(args.export_mbox)
+    if args.export_graph:
+        engine.export_relationship_graph(args.export_graph)
+    if args.export_receipts_ofx:
+        engine.export_receipts_ofx(args.export_receipts_ofx)
+    if args.export_location_timeline:
+        engine.export_location_timeline(args.export_location_timeline)
+    return 0
+
+
+def main(argv=None):
+    args = build_cli_parser().parse_args(argv)
+    if args.headless:
+        try:
+            return run_headless(args)
+        except Exception as exc:
+            print(f'Headless operation failed: {exc}', file=sys.stderr)
+            return 1
+    app = QApplication(sys.argv if argv is None else [sys.argv[0], *argv])
+    app.setStyleSheet(STYLESHEET); app.setStyle("Fusion")
     branding_icon = QIcon(str(_branding_icon_path()))
     app.setWindowIcon(branding_icon)
-    w = MainWindow(); w.show(); sys.exit(app.exec())
-    w.setWindowIcon(branding_icon)
+    window = MainWindow(); window.show()
+    return app.exec()
+
+
 if __name__ == "__main__":
-    main()
+    multiprocessing.freeze_support()
+    sys.exit(main())
